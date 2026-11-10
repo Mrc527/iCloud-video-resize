@@ -25,7 +25,12 @@ jobs:
         run: swift build
       - name: Test
         run: swift test
-      - name: Build the app bundle
+      - name: Build the iPad app (simulator, no signing)
+        run: |
+          xcodebuild -project iPad/SDVideoImport.xcodeproj -scheme SDVideoImport \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO -quiet build
+      - name: Build the Mac app bundle
         run: ./scripts/build-app.sh
       - name: Pack the app
         run: ditto -c -k --keepParent "build/iCloud Video Resize.app" build/iCloud-Video-Resize.zip

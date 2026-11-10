@@ -192,6 +192,8 @@ public struct NativeTranscoder: Transcoder {
 
 // MARK: - ffmpeg
 
+#if os(macOS)
+
 /// Uses an installed ffmpeg with libx265. Slow, but the files are smaller.
 public struct FFmpegTranscoder: Transcoder {
     public let executable: URL
@@ -299,3 +301,4 @@ public struct FFmpegTranscoder: Transcoder {
         progress(1)
     }
 }
+#endif

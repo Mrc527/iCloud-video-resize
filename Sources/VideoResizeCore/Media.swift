@@ -35,6 +35,10 @@ public struct MediaInfo: Equatable, Sendable {
     public var colorPrimaries: String?
     public var transferFunction: String?
     public var colorMatrix: String?
+    // When and where the video was shot, when the file says it.
+    public var captureDate: Date? = nil
+    public var latitude: Double? = nil
+    public var longitude: Double? = nil
 }
 
 public enum Probe {
@@ -56,6 +60,18 @@ public enum Probe {
         var bitrate = Double(rate)
         if bitrate <= 0, duration > 0 { bitrate = Double(fileSize) * 8 / duration }
 
+        var captureDate: Date?
+        if let item = try? await asset.load(.creationDate) {
+            captureDate = try? await item.load(.dateValue)
+        }
+        var place: (latitude: Double, longitude: Double)?
+        let common = (try? await asset.load(.commonMetadata)) ?? []
+        if let item = AVMetadataItem.metadataItems(
+            from: common, filteredByIdentifier: .commonIdentifierLocation).first,
+           let text = try? await item.load(.stringValue) {
+            place = ISO6709.parse(text)
+        }
+
         let transfer = description.flatMap { string($0, kCMFormatDescriptionExtension_TransferFunction) }
         return MediaInfo(
             duration: duration,
@@ -72,7 +88,10 @@ public enum Probe {
             hasLocation: has(metadata, .quickTimeMetadataLocationISO6709),
             colorPrimaries: description.flatMap { string($0, kCMFormatDescriptionExtension_ColorPrimaries) },
             transferFunction: transfer,
-            colorMatrix: description.flatMap { string($0, kCMFormatDescriptionExtension_YCbCrMatrix) }
+            colorMatrix: description.flatMap { string($0, kCMFormatDescriptionExtension_YCbCrMatrix) },
+            captureDate: captureDate,
+            latitude: place?.latitude,
+            longitude: place?.longitude
         )
     }
 
@@ -99,19 +118,47 @@ public enum Probe {
             description, extensionKey: kCMFormatDescriptionExtension_BitsPerComponent) as? Int {
             return bits
         }
-        // The HEVC configuration record stores "bit depth minus 8" in byte 17.
-        if let atoms = CMFormatDescriptionGetExtension(
+        let atoms = CMFormatDescriptionGetExtension(
             description,
             extensionKey: kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms)
-            as? [String: Any],
-           let hvcC = atoms["hvcC"] as? Data, hvcC.count > 17 {
+            as? [String: Any]
+        // The HEVC configuration record stores "bit depth minus 8" in byte 17.
+        if let hvcC = atoms?["hvcC"] as? Data, hvcC.count > 17 {
             return Int(hvcC[hvcC.startIndex + 17] & 0x07) + 8
+        }
+        // H.264 from cameras: the profiles High 10, High 4:2:2 and High 4:4:4
+        // are the ones used for 10-bit video. Byte 1 of the record is the profile.
+        if let avcC = atoms?["avcC"] as? Data, avcC.count > 1,
+           [110, 122, 244].contains(avcC[avcC.startIndex + 1]) {
+            return 10
         }
         // HDR video (HLG or PQ) is always 10 bit or more.
         if let transfer, transfer.contains("HLG") || transfer.contains("2084") {
             return 10
         }
         return 8
+    }
+}
+
+/// Reads a position written as "+45.4642+009.1900+120.000/".
+public enum ISO6709 {
+    public static func parse(_ text: String) -> (latitude: Double, longitude: Double)? {
+        let characters = Array(text.trimmingCharacters(in: .whitespaces))
+        // The latitude ends where the second sign begins.
+        guard characters.count > 2,
+              let split = characters.indices.dropFirst().first(where: {
+                  characters[$0] == "+" || characters[$0] == "-"
+              })
+        else { return nil }
+        let rest = characters[split...]
+        let end = rest.indices.dropFirst().first(where: {
+            rest[$0] == "+" || rest[$0] == "-" || rest[$0] == "/"
+        }) ?? rest.endIndex
+        guard let latitude = Double(String(characters[..<split])),
+              let longitude = Double(String(characters[split..<end])),
+              abs(latitude) <= 90, abs(longitude) <= 180
+        else { return nil }
+        return (latitude, longitude)
     }
 }
 

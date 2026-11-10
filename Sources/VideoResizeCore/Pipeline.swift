@@ -2,6 +2,7 @@ import Foundation
 
 public enum Phase: String, Sendable {
     case downloading = "Downloading"
+    case copying = "Copying"
     case encoding = "Encoding"
     case verifying = "Checking"
     case importing = "Adding to Photos"
@@ -127,10 +128,14 @@ public final class Pipeline: @unchecked Sendable {
         case .native:
             return NativeTranscoder()
         case .ffmpeg:
+            #if os(macOS)
             guard let executable = FFmpegTranscoder.locate(custom: settings.ffmpegPath) else {
                 throw MediaError.unsupported("ffmpeg was not found. Install it or use the Apple encoder")
             }
             return FFmpegTranscoder(executable: executable)
+            #else
+            return NativeTranscoder()  // ffmpeg cannot run on iPad or iPhone
+            #endif
         }
     }
 

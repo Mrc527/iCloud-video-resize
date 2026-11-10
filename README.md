@@ -1,7 +1,63 @@
 # iCloud Video Resize
 
-A macOS app that re-encodes the videos of your iCloud Photos library to HEVC
-(H.265), at the same resolution, to save iCloud space.
+Two apps that make your videos smaller with HEVC (H.265), at the same
+resolution, so they take less iCloud space and less time to upload.
+
+| App | Where | What it does |
+|---|---|---|
+| **SD Video Import** | iPad, iPhone | Imports videos from an SD card and makes them smaller **before** they go into Photos. iCloud uploads only the small version. |
+| **iCloud Video Resize** | Mac | Makes smaller the videos that are **already** in your iCloud Photos library. |
+
+Both use the same code to encode and to check the result.
+
+# SD Video Import (iPad)
+
+## How it works
+
+1. Connect the SD card and press **Choose card**. Pick the card or a folder on it.
+2. The app lists the videos. The ones not yet imported are selected.
+3. Press **Import**. For each video the app:
+   - encodes it to HEVC, with the same resolution and frame rate, the audio
+     copied without changes, and 10-bit video kept 10-bit;
+   - checks the new file: codec, resolution, duration, audio tracks, and a
+     decode of every frame;
+   - adds the new file to Photos, with the capture date and place of the
+     original.
+4. A video that would not get at least 20% smaller is added as it is.
+
+The card is only read. The app never changes or deletes anything on it, so
+the card stays your backup until you format it.
+
+The app remembers what it imported. If you insert the same card again, the
+videos already in Photos are not selected.
+
+The app asks only for permission to **add** to Photos. It cannot see or
+change the photos you already have.
+
+## Limits you should know
+
+- **Keep the app on screen while it works.** iPadOS stops the video encoder
+  when an app goes to the background. If you leave the app, the import
+  pauses cleanly and you press Import again later. The screen stays on by
+  itself during the import.
+- **Formats.** The app reads MP4, MOV and M4V files. AVCHD (.MTS), MXF and
+  raw video cannot be read by iPadOS: the app tells you how many it found.
+- **4:2:2 video** from some cameras becomes 4:2:0, which is what Photos and
+  iCloud use for playback anyway.
+- **Log profiles** (S-Log, C-Log, V-Log) are kept as they are, not converted.
+- If a video cannot be re-encoded for an unexpected reason, it is marked as
+  failed and is not added. You can try again, or import it with Photos.
+
+## Build and install
+
+You need a Mac with Xcode 16 or newer and an Apple Developer account.
+
+1. Open `iPad/SDVideoImport.xcodeproj` in Xcode.
+2. Select the **SDVideoImport** target, then **Signing & Capabilities**, and
+   choose your team.
+3. Connect the iPad, choose it as the destination, and press Run.
+
+# iCloud Video Resize (Mac)
 
 ## How it works
 
@@ -101,17 +157,19 @@ access to Photos again.
 If the app stops while it is adding a video to Photos, that video is marked
 "Check Photos for a duplicate" and is never retried automatically.
 
-## Development
+# Development
 
 ```bash
 swift build
 swift test
 ```
 
-- `Sources/VideoResizeCore`: Photos access, encoding, checks, state.
-- `Sources/VideoResizeApp`: the SwiftUI interface.
+- `Sources/VideoResizeCore`: Photos access, encoding, checks, state. Used by
+  both apps.
+- `Sources/VideoResizeApp`: the Mac interface.
+- `iPad/`: the Xcode project and the interface of the iPad app.
 - `Tests`: the tests really encode short videos with the Apple encoder, and
   use a fake photo library.
 
-A GitHub Action builds and tests every push on a macOS runner, and uploads
-the built app as an artifact.
+A GitHub Action builds and tests every push on a macOS runner. It also
+builds the iPad app for the simulator, and uploads the Mac app as an artifact.

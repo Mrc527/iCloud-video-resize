@@ -1,3 +1,4 @@
+import CoreLocation
 import Foundation
 import Photos
 
@@ -175,5 +176,46 @@ public final class PhotoKitLibrary: VideoLibrary, @unchecked Sendable {
         try await PHPhotoLibrary.shared().performChanges {
             PHAssetChangeRequest.deleteAssets(assets)
         }
+    }
+}
+
+// MARK: - Adding new videos (used by the iPad app)
+
+/// Something that can receive a finished video. The tests use a fake one.
+public protocol PhotoSink: Sendable {
+    /// Add a video file to the photo library. The file is moved, not copied.
+    func add(file: URL, creationDate: Date?, latitude: Double?,
+             longitude: Double?) async throws -> String
+}
+
+/// Adds videos to Photos. Needs only the "add" permission: the app cannot
+/// see or change the photos that are already in the library.
+public final class PhotoKitSink: PhotoSink, @unchecked Sendable {
+    public init() {}
+
+    public static func requestAccess() async -> Bool {
+        let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
+        return status == .authorized || status == .limited
+    }
+
+    public func add(file: URL, creationDate: Date?, latitude: Double?,
+                    longitude: Double?) async throws -> String {
+        let created = Box("")
+        try await PHPhotoLibrary.shared().performChanges {
+            let request = PHAssetCreationRequest.forAsset()
+            let options = PHAssetResourceCreationOptions()
+            options.originalFilename = file.lastPathComponent
+            options.shouldMoveFile = true
+            request.addResource(with: .video, fileURL: file, options: options)
+            if let creationDate {
+                request.creationDate = creationDate
+            }
+            if let latitude, let longitude {
+                request.location = CLLocation(latitude: latitude, longitude: longitude)
+            }
+            created.value = request.placeholderForCreatedAsset?.localIdentifier ?? ""
+        }
+        guard !created.value.isEmpty else { throw LibraryError.importFailed }
+        return created.value
     }
 }
