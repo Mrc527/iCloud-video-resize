@@ -139,3 +139,65 @@ final class ImporterTests: TempDirectoryTestCase {
         XCTAssertEqual(log.entries[video.id]?.outcome, .failed)
     }
 }
+
+final class InboxTests: TempDirectoryTestCase {
+    private func makeCardFile() throws -> SourceVideo {
+        let card = temp.appendingPathComponent("card")
+        try FileManager.default.createDirectory(at: card, withIntermediateDirectories: true)
+        try Data(repeating: 1, count: 1234).write(to: card.appendingPathComponent("C0001.MP4"))
+        return try XCTUnwrap(SourceScanner.scan(folder: card).videos.first)
+    }
+
+    func testCopyDoesNotNeedTheCardAnymore() throws {
+        let video = try makeCardFile()
+        let inbox = Inbox(directory: temp.appendingPathComponent("inbox"))
+        try inbox.add(video)
+        try inbox.add(video)  // a second time changes nothing
+
+        XCTAssertTrue(inbox.contains(video.id))
+        XCTAssertEqual(inbox.totalBytes, 1234)
+        let local = try XCTUnwrap(inbox.pending.first)
+        XCTAssertEqual(inbox.pending.count, 1)
+        XCTAssertEqual(local.id, video.id, "The copy must be recognised as the same video")
+        XCTAssertNotEqual(local.url, video.url)
+
+        // The card is removed: the copy is still readable.
+        try FileManager.default.removeItem(at: temp.appendingPathComponent("card"))
+        XCTAssertEqual(try Data(contentsOf: local.url).count, 1234)
+    }
+
+    func testWaitingVideosSurviveARestart() throws {
+        let video = try makeCardFile()
+        let directory = temp.appendingPathComponent("inbox")
+        try Inbox(directory: directory).add(video)
+
+        let reopened = Inbox(directory: directory)
+        XCTAssertEqual(reopened.pending.map(\.id), [video.id])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: reopened.pending[0].url.path))
+    }
+
+    func testRemoveDeletesTheCopyButNotTheCardFile() throws {
+        let video = try makeCardFile()
+        let directory = temp.appendingPathComponent("inbox")
+        let inbox = Inbox(directory: directory)
+        try inbox.add(video)
+        let local = try XCTUnwrap(inbox.pending.first)
+
+        inbox.remove(video.id)
+        XCTAssertTrue(inbox.pending.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: local.url.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: video.url.path))
+        XCTAssertTrue(Inbox(directory: directory).pending.isEmpty)
+    }
+
+    func testFailedCopyLeavesNothingBehind() throws {
+        let missing = SourceVideo(url: temp.appendingPathComponent("gone.mp4"),
+                                  filename: "gone.mp4", fileSize: 10, modified: nil)
+        let directory = temp.appendingPathComponent("inbox")
+        let inbox = Inbox(directory: directory)
+        XCTAssertThrowsError(try inbox.add(missing))
+        XCTAssertTrue(inbox.pending.isEmpty)
+        let left = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        XCTAssertEqual(left, [])
+    }
+}

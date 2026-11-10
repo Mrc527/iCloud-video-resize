@@ -7,14 +7,14 @@ import VideoResizeCore
 @MainActor
 final class ProgressModel: ObservableObject {
     @Published var filename: String?
-    @Published var phase: Phase = .encoding
+    @Published var phase: Phase = .copying
     @Published var fraction: Double = 0
     @Published var position = ""
 
-    func begin(_ filename: String, position: String) {
+    func begin(_ filename: String, position: String, phase: Phase) {
         self.filename = filename
         self.position = position
-        phase = .encoding
+        self.phase = phase
         fraction = 0
     }
 
@@ -28,25 +28,37 @@ final class ProgressModel: ObservableObject {
     }
 }
 
+/// The import works in two steps, so the card is needed only for a short time:
+///
+/// 1. Copy the videos from the card to this iPad. This is fast.
+/// 2. Re-encode the copies and add them to Photos. This is slow, but the
+///    card can already be removed.
 @MainActor
 final class ImportModel: ObservableObject {
     @Published var settings: AppSettings {
         didSet { settings.save() }
     }
     @Published var folderName: String?
+    /// Videos on the card.
     @Published var videos: [SourceVideo] = []
     @Published var unsupported: [String] = []
     @Published var selection: Set<String> = []
+    /// Videos copied to this iPad, waiting to be re-encoded.
+    @Published var waiting: [SourceVideo] = []
     @Published var entries: [String: ImportEntry] = [:]
     @Published var isScanning = false
     @Published var isRunning = false
     @Published var isStopping = false
+    /// True when every selected video is copied: the card can be removed.
+    @Published var cardCanBeRemoved = false
     @Published var message: String?
 
     let progress = ProgressModel()
 
     private let log: ImportLog
+    private let inbox: Inbox
     private let importer: Importer
+    private let inboxDirectory: URL
     private var folder: URL?
     private var worker: Task<Void, Never>?
 
@@ -57,10 +69,13 @@ final class ImportModel: ObservableObject {
         try? fileManager.removeItem(at: work)  // leftovers of a previous run
         try? fileManager.createDirectory(at: work, withIntermediateDirectories: true)
 
+        inboxDirectory = support.appendingPathComponent("inbox")
+        inbox = Inbox(directory: inboxDirectory)
         log = ImportLog(url: support.appendingPathComponent("imports.json"))
         importer = Importer(sink: PhotoKitSink(), log: log, workDirectory: work)
         settings = AppSettings.load()
         entries = log.entries
+        waiting = inbox.pending
     }
 
     // MARK: - Derived data
@@ -71,6 +86,10 @@ final class ImportModel: ObservableObject {
         return entry.outcome != .failed
     }
 
+    func isWaiting(_ video: SourceVideo) -> Bool {
+        waiting.contains { $0.id == video.id }
+    }
+
     var selected: [SourceVideo] {
         videos.filter { selection.contains($0.id) }
     }
@@ -79,14 +98,18 @@ final class ImportModel: ObservableObject {
         selected.reduce(0) { $0 + $1.fileSize }
     }
 
-    /// Space saved on this card: what will not be uploaded to iCloud.
+    var waitingBytes: Int64 {
+        waiting.reduce(0) { $0 + $1.fileSize }
+    }
+
+    /// Space saved so far: what iCloud will not have to upload.
     var savedBytes: Int64 {
-        videos.compactMap { entries[$0.id] }
+        entries.values
             .filter { $0.outcome == .reencoded }
             .reduce(0) { $0 + max($1.originalSize - $1.newSize, 0) }
     }
 
-    // MARK: - Actions
+    // MARK: - Card
 
     func open(_ url: URL) async {
         closeFolder()
@@ -102,18 +125,29 @@ final class ImportModel: ObservableObject {
     func scan() async {
         guard let folder, !isScanning, !isRunning else { return }
         isScanning = true
+        cardCanBeRemoved = false
         let result = await Task.detached(priority: .userInitiated) {
             SourceScanner.scan(folder: folder)
         }.value
         videos = result.videos
         unsupported = result.unsupported
         entries = log.entries
-        selection = Set(result.videos.filter { !isDone($0) }.map(\.id))
+        waiting = inbox.pending
+        selection = Set(result.videos.filter { !isDone($0) && !isWaiting($0) }.map(\.id))
         isScanning = false
     }
 
-    func toggle(_ video: SourceVideo) {
+    func closeCard() {
         guard !isRunning else { return }
+        closeFolder()
+        videos = []
+        unsupported = []
+        selection = []
+        cardCanBeRemoved = false
+    }
+
+    func toggle(_ video: SourceVideo) {
+        guard !isRunning, !isWaiting(video) else { return }
         if selection.contains(video.id) {
             selection.remove(video.id)
         } else {
@@ -121,47 +155,111 @@ final class ImportModel: ObservableObject {
         }
     }
 
+    /// Delete a local copy that is waiting. The video stays on the card.
+    func discard(_ video: SourceVideo) {
+        guard !isRunning else { return }
+        inbox.remove(video.id)
+        waiting = inbox.pending
+    }
+
+    private func closeFolder() {
+        folder?.stopAccessingSecurityScopedResource()
+        folder = nil
+        folderName = nil
+    }
+
+    // MARK: - Import
+
     func start() async {
         guard !isRunning else { return }
-        let queue = selected
-        guard !queue.isEmpty else { return }
+        let toCopy = selected
+        guard !toCopy.isEmpty || !waiting.isEmpty else { return }
+
         guard await PhotoKitSink.requestAccess() else {
             message = "The app cannot add videos to Photos. Open Settings, then Privacy & Security, "
                 + "then Photos, and allow this app to add photos."
             return
         }
+        if let problem = spaceProblem(for: toCopy) {
+            message = problem
+            return
+        }
+
         isRunning = true
+        cardCanBeRemoved = false
         UIApplication.shared.isIdleTimerDisabled = true  // keep the screen on
         let settings = settings
         let importer = importer
+        let inbox = inbox
         let progress = progress
 
         worker = Task {
+            // Step 1: copy from the card. Fast.
+            var copyErrors: [String] = []
+            for (index, video) in toCopy.enumerated() {
+                if Task.isCancelled { break }
+                progress.begin(video.filename, position: "\(index + 1) of \(toCopy.count)",
+                               phase: .copying)
+                do {
+                    try await Task.detached(priority: .userInitiated) {
+                        try inbox.add(video)
+                    }.value
+                    self.selection.remove(video.id)
+                } catch {
+                    copyErrors.append("\(video.filename): \(error.localizedDescription)")
+                }
+                self.waiting = inbox.pending
+            }
+            if !toCopy.isEmpty, self.selection.isEmpty {
+                self.cardCanBeRemoved = true
+            }
+
+            // Step 2: re-encode the local copies. Slow, the card is not needed.
             var failures = 0
+            let queue = inbox.pending
             for (index, video) in queue.enumerated() {
                 if Task.isCancelled { break }
-                progress.begin(video.filename, position: "\(index + 1) of \(queue.count)")
+                progress.begin(video.filename, position: "\(index + 1) of \(queue.count)",
+                               phase: .encoding)
                 let entry = await importer.importVideo(video, settings: settings) { phase, fraction in
                     Task { @MainActor in progress.update(phase, fraction) }
                 }
-                self.entries = self.log.entries
                 if let entry {
                     if entry.outcome == .failed {
-                        failures += 1
+                        failures += 1  // the copy stays, so it can be tried again
                     } else {
-                        self.selection.remove(video.id)
+                        inbox.remove(video.id)
                     }
                 }
+                self.entries = self.log.entries
+                self.waiting = inbox.pending
             }
+
             progress.end()
             UIApplication.shared.isIdleTimerDisabled = false
             self.isRunning = false
             self.isStopping = false
-            if failures > 0 {
-                self.message = "\(failures) video(s) could not be imported. "
-                    + "They are still selected, so you can try again."
+            if let first = copyErrors.first {
+                self.message = "\(copyErrors.count) video(s) could not be copied from the card. "
+                    + "Do not remove the card yet. First error: \(first)"
+            } else if failures > 0 {
+                self.message = "\(failures) video(s) could not be re-encoded. They are still on "
+                    + "this iPad. Press Continue to try again, or swipe to remove them."
             }
         }
+    }
+
+    /// The copies need room on this iPad until they are re-encoded.
+    private func spaceProblem(for videos: [SourceVideo]) -> String? {
+        let values = try? inboxDirectory.resourceValues(
+            forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        guard let free = values?.volumeAvailableCapacityForImportantUsage else { return nil }
+        // Room for all the copies, plus the biggest video twice while it is in work.
+        let biggest = (videos + waiting).map(\.fileSize).max() ?? 0
+        let needed = videos.reduce(0) { $0 + $1.fileSize } + biggest * 2
+        guard free < needed else { return nil }
+        return "Not enough free space on this iPad: \(Format.bytes(needed)) needed, "
+            + "\(Format.bytes(free)) free. Select fewer videos and import in more rounds."
     }
 
     /// Stop after the current step. A video that is already being added to
@@ -177,13 +275,8 @@ final class ImportModel: ObservableObject {
     func appWentToBackground() {
         guard isRunning, !isStopping else { return }
         stop()
-        message = "The import was paused because the app was closed. "
-            + "Keep the app on screen while it works, then press Import again."
-    }
-
-    private func closeFolder() {
-        folder?.stopAccessingSecurityScopedResource()
-        folder = nil
+        message = "The import was paused because the app was closed. Nothing is lost: "
+            + "the videos already copied are on this iPad. Open the app and press Continue."
     }
 }
 

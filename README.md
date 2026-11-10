@@ -16,14 +16,21 @@ Both use the same code to encode and to check the result.
 
 1. Connect the SD card and press **Choose card**. Pick the card or a folder on it.
 2. The app lists the videos. The ones not yet imported are selected.
-3. Press **Import**. For each video the app:
-   - encodes it to HEVC, with the same resolution and frame rate, the audio
-     copied without changes, and 10-bit video kept 10-bit;
-   - checks the new file: codec, resolution, duration, audio tracks, and a
-     decode of every frame;
-   - adds the new file to Photos, with the capture date and place of the
-     original.
+3. Press **Import**. The work has two steps, so you need the card only for
+   a short time:
+   - **Copy.** The videos are copied from the card to the iPad. This is as
+     fast as the card can be read. When it is done the app says
+     "You can remove the card now".
+   - **Re-encode.** For each copy the app encodes it to HEVC (same
+     resolution and frame rate, audio copied without changes, 10-bit video
+     kept 10-bit), checks the new file (codec, resolution, duration, audio
+     tracks, a decode of every frame), and adds it to Photos with the
+     capture date and place of the original. Then the copy is deleted.
 4. A video that would not get at least 20% smaller is added as it is.
+
+The copies wait safely on the iPad. You can close the app and continue
+later with **Continue**. The iPad needs free space for the copies until they
+are re-encoded: if there is not enough, the app tells you before it starts.
 
 The card is only read. The app never changes or deletes anything on it, so
 the card stays your backup until you format it.

@@ -11,7 +11,7 @@ struct ContentView: View {
     var body: some View {
         NavigationStack {
             Group {
-                if model.folderName == nil {
+                if model.folderName == nil && model.waiting.isEmpty {
                     WelcomeView { pickingFolder = true }
                 } else {
                     VideoList()
@@ -77,8 +77,9 @@ struct WelcomeView: View {
         VStack(spacing: 16) {
             Image(systemName: "sdcard").font(.system(size: 56)).foregroundStyle(.secondary)
             Text("Import videos from an SD card").font(.title2)
-            Text("The app makes each video smaller before it goes into Photos, "
-                + "so iCloud has less to upload. The card is only read, never changed.")
+            Text("The app first copies the videos to this iPad, so you can remove the card "
+                + "after a few minutes. Then it makes each video smaller before it goes "
+                + "into Photos, so iCloud has less to upload. The card is never changed.")
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: 440)
@@ -95,37 +96,66 @@ struct VideoList: View {
 
     var body: some View {
         List {
-            if model.isScanning {
-                HStack(spacing: 12) {
-                    ProgressView()
-                    Text("Reading the card…").foregroundStyle(.secondary)
-                }
-            } else if model.videos.isEmpty {
-                Text("No videos found in this folder.").foregroundStyle(.secondary)
+            if model.cardCanBeRemoved {
+                Label("All the videos are copied. You can remove the card now.",
+                      systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
             }
 
-            Section {
-                ForEach(model.videos) { video in
-                    VideoRow(video: video)
+            if !model.waiting.isEmpty {
+                Section {
+                    ForEach(model.waiting) { video in
+                        WaitingRow(video: video)
+                    }
+                } header: {
+                    Text("On this iPad, waiting")
+                } footer: {
+                    Text("These videos are copied from the card. The card is not needed for them.")
                 }
-            } footer: {
-                if !model.unsupported.isEmpty {
-                    Text("\(model.unsupported.count) file(s) are in a format this iPad cannot read "
-                        + "(for example AVCHD or MXF) and are not listed: "
-                        + model.unsupported.prefix(5).joined(separator: ", ")
-                        + (model.unsupported.count > 5 ? "…" : ""))
+            }
+
+            if model.folderName != nil {
+                Section {
+                    if model.isScanning {
+                        HStack(spacing: 12) {
+                            ProgressView()
+                            Text("Reading the card…").foregroundStyle(.secondary)
+                        }
+                    } else if model.videos.isEmpty {
+                        Text("No videos found in this folder.").foregroundStyle(.secondary)
+                    }
+                    ForEach(model.videos) { video in
+                        CardRow(video: video)
+                    }
+                } header: {
+                    Text("On the card")
+                } footer: {
+                    if !model.unsupported.isEmpty {
+                        Text("\(model.unsupported.count) file(s) are in a format this iPad cannot "
+                            + "read (for example AVCHD or MXF) and are not listed: "
+                            + model.unsupported.prefix(5).joined(separator: ", ")
+                            + (model.unsupported.count > 5 ? "…" : ""))
+                    }
                 }
             }
         }
     }
 }
 
-struct VideoRow: View {
+private func subtitle(_ video: SourceVideo) -> String {
+    var parts = [Format.bytes(video.fileSize)]
+    if let date = video.modified { parts.append(Format.date.string(from: date)) }
+    return parts.joined(separator: "  ·  ")
+}
+
+/// A video on the card. Tap to select it.
+struct CardRow: View {
     @EnvironmentObject private var model: ImportModel
     let video: SourceVideo
 
     var body: some View {
         let entry = model.entries[video.id]
+        let isWaiting = model.isWaiting(video)
         let isSelected = model.selection.contains(video.id)
         Button {
             model.toggle(video)
@@ -134,25 +164,49 @@ struct VideoRow: View {
                 Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                     .font(.title3)
                     .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                    .opacity(isWaiting ? 0.3 : 1)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(video.filename).foregroundStyle(.primary)
-                    Text(subtitle).font(.caption).foregroundStyle(.secondary)
+                    Text(subtitle(video)).font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                if let entry {
+                if isWaiting {
+                    Label("Copied to this iPad", systemImage: "ipad.and.arrow.forward")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else if let entry {
                     StatusLabel(entry: entry)
                 }
             }
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(model.isRunning)
+        .disabled(model.isRunning || isWaiting)
     }
+}
 
-    private var subtitle: String {
-        var parts = [Format.bytes(video.fileSize)]
-        if let date = video.modified { parts.append(Format.date.string(from: date)) }
-        return parts.joined(separator: "  ·  ")
+/// A video already copied to this iPad. Swipe to remove the copy.
+struct WaitingRow: View {
+    @EnvironmentObject private var model: ImportModel
+    let video: SourceVideo
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "clock").font(.title3).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(video.filename)
+                Text(subtitle(video)).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            if let entry = model.entries[video.id], entry.outcome == .failed {
+                StatusLabel(entry: entry)
+            }
+        }
+        .swipeActions {
+            Button("Remove", role: .destructive) {
+                model.discard(video)
+            }
+            .disabled(model.isRunning)
+        }
     }
 }
 
@@ -187,7 +241,7 @@ struct BottomBar: View {
     @ObservedObject var progress: ProgressModel
 
     var body: some View {
-        if model.folderName != nil {
+        if model.folderName != nil || !model.waiting.isEmpty {
             VStack(spacing: 10) {
                 if let filename = progress.filename {
                     VStack(alignment: .leading, spacing: 4) {
@@ -199,13 +253,15 @@ struct BottomBar: View {
                         } else {
                             ProgressView().progressViewStyle(.linear)
                         }
-                        Text("Keep the app on screen while it works.")
+                        Text(progress.phase == .copying && !model.cardCanBeRemoved
+                             ? "Copying from the card. Do not remove it yet."
+                             : "Keep the app on screen while it works.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
                 HStack {
                     if model.savedBytes > 0 {
-                        Text("Saved on this card: \(Format.bytes(model.savedBytes))")
+                        Text("Saved so far: \(Format.bytes(model.savedBytes))")
                             .font(.callout).foregroundStyle(.secondary)
                     }
                     Spacer()
@@ -216,18 +272,26 @@ struct BottomBar: View {
                         .buttonStyle(.bordered)
                         .disabled(model.isStopping)
                     } else {
-                        Button("Import \(model.selection.count) video(s), "
-                            + Format.bytes(model.selectedBytes)) {
+                        Button(startTitle) {
                             Task { await model.start() }
                         }
                         .buttonStyle(.borderedProminent)
-                        .disabled(model.selection.isEmpty || model.isScanning)
+                        .disabled((model.selection.isEmpty && model.waiting.isEmpty)
+                                  || model.isScanning)
                     }
                 }
             }
             .padding()
             .background(.bar)
         }
+    }
+
+    private var startTitle: String {
+        if model.selection.isEmpty {
+            return "Continue: \(model.waiting.count) video(s) waiting, "
+                + Format.bytes(model.waitingBytes)
+        }
+        return "Import \(model.selection.count) video(s), " + Format.bytes(model.selectedBytes)
     }
 }
 

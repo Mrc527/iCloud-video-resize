@@ -221,3 +221,88 @@ public final class Importer: @unchecked Sendable {
                            detail: "Added as it is. \(keepReason ?? "")")
     }
 }
+
+/// Videos copied from the card to this device, waiting to be re-encoded.
+/// Once a video is here the card is no longer needed. The list survives a
+/// restart of the app.
+public final class Inbox: @unchecked Sendable {
+    private struct Item: Codable {
+        var filename: String
+        var fileSize: Int64
+        var modified: Date?
+        var folder: String
+    }
+
+    private let directory: URL
+    private let lock = NSLock()
+    private var items: [String: Item] = [:]
+
+    public init(directory: URL) {
+        self.directory = directory
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        if let data = try? Data(contentsOf: manifest),
+           let decoded = try? JSONDecoder().decode([String: Item].self, from: data) {
+            // Forget entries whose file is gone.
+            items = decoded.filter { FileManager.default.fileExists(atPath: file($0.value).path) }
+        }
+    }
+
+    private var manifest: URL { directory.appendingPathComponent("manifest.json") }
+
+    private func file(_ item: Item) -> URL {
+        directory.appendingPathComponent(item.folder).appendingPathComponent(item.filename)
+    }
+
+    /// The local copies, oldest video first. Each has the same `id` as the
+    /// file on the card it was copied from.
+    public var pending: [SourceVideo] {
+        lock.lock(); defer { lock.unlock() }
+        return items.values
+            .map { SourceVideo(url: file($0), filename: $0.filename, fileSize: $0.fileSize,
+                               modified: $0.modified) }
+            .sorted {
+                ($0.modified ?? .distantPast, $0.filename) < ($1.modified ?? .distantPast, $1.filename)
+            }
+    }
+
+    public var totalBytes: Int64 {
+        lock.lock(); defer { lock.unlock() }
+        return items.values.reduce(0) { $0 + $1.fileSize }
+    }
+
+    public func contains(_ id: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return items[id] != nil
+    }
+
+    /// Copy a video from the card. The file on the card is not changed.
+    public func add(_ video: SourceVideo) throws {
+        if contains(video.id) { return }
+        let item = Item(filename: video.filename, fileSize: video.fileSize,
+                        modified: video.modified, folder: UUID().uuidString)
+        let folder = directory.appendingPathComponent(item.folder)
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try FileManager.default.copyItem(at: video.url, to: file(item))
+        } catch {
+            try? FileManager.default.removeItem(at: folder)  // no half copied files
+            throw error
+        }
+        lock.lock(); defer { lock.unlock() }
+        items[video.id] = item
+        save()
+    }
+
+    /// Delete the local copy. The file on the card is not touched.
+    public func remove(_ id: String) {
+        lock.lock(); defer { lock.unlock() }
+        guard let item = items.removeValue(forKey: id) else { return }
+        try? FileManager.default.removeItem(at: directory.appendingPathComponent(item.folder))
+        save()
+    }
+
+    private func save() {
+        guard let data = try? JSONEncoder().encode(items) else { return }
+        try? data.write(to: manifest, options: .atomic)
+    }
+}
