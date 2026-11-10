@@ -1,6 +1,7 @@
-__pycache__/
-*.egg-info/
-.pytest_cache/
-.venv/
+.build/
 build/
-dist/
+.swiftpm/
+*.xcodeproj
+xcuserdata/
+DerivedData/
+.DS_Store
