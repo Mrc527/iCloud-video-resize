@@ -1,0 +1,32 @@
+# Copy to ~/.config/icvr/config.toml and change what you need.
+# Every line is optional. The values below are the defaults.
+
+# --- Encoding ---
+encoder = "libx265"        # "libx265" (slow, smallest files) or "videotoolbox" (fast, Apple hardware)
+crf = 24                   # libx265 quality. Lower = better quality and bigger file. 22-26 is a good range
+preset = "medium"          # libx265 speed: faster, fast, medium, slow
+vt_quality = 55            # videotoolbox quality, 1-100. Higher = better
+nice = 10                  # CPU priority of ffmpeg. 0 = normal, 19 = lowest
+
+# --- Which videos to touch ---
+min_size_mb = 20           # ignore videos smaller than this
+min_age_days = 7           # ignore videos newer than this
+min_bits_per_pixel = 0.05  # videos below this are already well compressed
+min_saving_percent = 20    # keep the new file only if it is at least this much smaller
+
+# --- Safety ---
+full_decode_check = true   # decode the whole new file before trusting it
+max_attempts = 3           # stop retrying a video after this many errors
+
+# --- Service loop ---
+scan_interval_minutes = 360
+max_videos_per_run = 20
+
+# --- Photos ---
+delete_album = "icvr - originals to delete"
+marker_keyword = "icvr-reencoded"
+export_timeout_seconds = 3600
+
+# data_dir = "~/Library/Application Support/icvr"
+# ffmpeg = "/opt/homebrew/bin/ffmpeg"
+# ffprobe = "/opt/homebrew/bin/ffprobe"
