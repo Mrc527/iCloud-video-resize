@@ -1,132 +1,117 @@
-# iCloud video resize (icvr)
+# iCloud Video Resize
 
-A background service for a Mac that is always on. It re-encodes the videos of
-your iCloud Photos library to HEVC (H.265), at the same resolution, to save
-iCloud space.
+A macOS app that re-encodes the videos of your iCloud Photos library to HEVC
+(H.265), at the same resolution, to save iCloud space.
 
 ## How it works
 
-For each video, biggest first:
+The app shows all the videos of your Photos library and marks the ones worth
+re-encoding. When you press **Start**, for each video, biggest first:
 
-1. **Fetch** the original. If it is only in iCloud, Photos downloads it.
-2. **Encode** it with `ffmpeg` to HEVC. Same resolution, same frame rate,
-   audio copied without changes, 10-bit HDR kept, date and GPS kept.
-3. **Verify** the new file: codec, resolution, duration, audio tracks,
-   date metadata, and a full decode of the file.
+1. **Download.** If the original is only in iCloud, Photos downloads it.
+2. **Encode** to HEVC. Same resolution, same frame rate, audio copied without
+   changes, 10-bit HDR kept, capture date and GPS kept.
+3. **Check** the new file: codec, resolution, duration, audio tracks, date,
+   GPS, and a full decode of every frame.
 4. **Check the saving.** If the new file is not at least 20% smaller, the
    original stays and nothing changes.
-5. **Import** the new video into Photos. Title, description, keywords,
-   favorite and albums are copied from the original. The new video gets the
-   keyword `icvr-reencoded`.
-6. **Park the original** in the album `icvr - originals to delete`.
+5. **Add** the new video to Photos, with the same date, place, favorite flag
+   and albums as the original.
+6. **Park** the original in the album `Video Resize: originals to delete`.
 
-The service never deletes anything by itself. You run `icvr purge` when you
-want. It checks again that each new video is still in Photos, then moves the
-originals to Recently Deleted. macOS asks you to confirm once for the whole
-batch (this dialog is a macOS rule and cannot be skipped). The originals stay
-recoverable for 30 days.
+The app never deletes anything by itself. When you are happy with the result,
+press **Delete originals**. The app checks again that each new video is still
+in Photos, then moves the originals to Recently Deleted. macOS asks you to
+confirm once for the whole batch. The originals stay recoverable for 30 days.
 
-Note: iCloud space goes **up** a little until you purge, and it is fully free
-only when Recently Deleted is emptied.
+Note: iCloud space goes **up** a little until you delete the originals, and
+it is fully free only when Recently Deleted is emptied.
 
 ## What it leaves alone
 
-- Videos edited in Photos (the edit history would be lost)
-- Slow motion and time-lapse videos
-- Cinematic and spatial videos (more than one video track)
+- Videos edited in Photos (the edits would be lost)
+- Slow motion, time-lapse, cinematic and spatial videos
 - Live Photos (they are photos, not videos)
-- Hidden videos, shared albums, referenced files
+- Hidden videos and shared albums
 - Videos smaller than 20 MB or newer than 7 days
 - Videos that are already well compressed
 
-Known limit: Dolby Vision metadata of iPhone HDR videos is not kept. The
-video stays HDR (HLG, 10-bit), which is what most screens use anyway.
+## Limits you should know
 
-## Install
+- **Titles, captions and keywords** that you added in Photos are not copied to
+  the new video. Apple gives apps no way to read or write them.
+- **Dolby Vision** metadata of iPhone HDR videos may not be kept. The video
+  stays HDR (HLG, 10-bit).
+- The app works only while it is open. It keeps the Mac awake while it works.
 
-You need macOS, Python 3.11 or newer, and Homebrew.
+## Build and run
 
-```bash
-brew install ffmpeg pipx
-pipx install git+https://github.com/mrc527/icloud-video-resize.git
-```
-
-Optional: copy `config.example.toml` to `~/.config/icvr/config.toml` and edit it.
-
-## First run
-
-Do these steps by hand, in Terminal, before you install the service. macOS
-will ask for permission to read the Photos library and to control Photos.
-Say yes.
+You need macOS 14 or newer and Xcode (or the Xcode command line tools).
 
 ```bash
-icvr scan                       # shows what would be done, changes nothing
-icvr once --limit 1 --dry-run   # encodes one video, does not touch Photos
-icvr once --limit 1             # really replaces one video
+git clone https://github.com/mrc527/icloud-video-resize.git
+cd icloud-video-resize
+./scripts/build-app.sh
+open "build/iCloud Video Resize.app"
 ```
 
-Then open Photos, look at the new video (search for `icvr-reencoded`) and
-compare it with the original in the album `icvr - originals to delete`.
-If you are happy:
+At the first start macOS asks for access to Photos. Choose full access.
 
-```bash
-icvr purge                      # deletes the parked originals
-```
+Always start the app from the bundle built by the script. `swift run` does
+not work: macOS gives access to Photos only to a real app bundle.
 
-## Run as a service
+The app is signed for your Mac only. After each new build macOS may ask for
+access to Photos again.
 
-```bash
-./launchd/install.sh
-```
+## First use
 
-The service scans the library every 6 hours and processes up to 20 videos per
-cycle. Log file: `~/Library/Logs/icvr/icvr.log`.
+1. Open the app. It reads the library and fills the **To do** list.
+2. Open **Settings** and set the minimum size very high, so that only one or
+   two videos stay in the list. Press **Start**.
+3. In Photos, compare the new video with the original in the album
+   `Video Resize: originals to delete`.
+4. If the result is good, set the minimum size back and let it run.
 
-It must run as a launchd *agent* inside your user session, because Photos
-needs a logged-in user. Keep the Mac logged in.
+## Settings
 
-## Commands
+| Setting | Default | Meaning |
+|---|---|---|
+| Encoder | Apple | Apple hardware encoder, or ffmpeg x265 |
+| Quality | Balanced | High quality, Balanced, or Small files |
+| Minimum size | 20 MB | Smaller videos are left alone |
+| Minimum age | 7 days | Newer videos are left alone |
+| Minimum saving | 20% | Below this the original is kept |
+| Full decode check | On | Decode every frame of the new video before using it |
 
-| Command | What it does |
-|---|---|
-| `icvr scan` | List what would be re-encoded and why the rest is skipped |
-| `icvr once [--limit N] [--dry-run]` | Run one cycle and exit |
-| `icvr run` | Run forever (used by launchd) |
-| `icvr status` | Show totals, space saved, errors |
-| `icvr purge` | Delete the originals that were replaced |
+### Encoders
 
-## Status values
+- **Apple** (default): fast, uses little power, needs nothing else installed.
+  The target bit rate depends on resolution and frame rate. Balanced gives
+  about 5 Mbit/s for 1080p at 30 fps and about 14 Mbit/s for 4K at 30 fps.
+- **ffmpeg x265**: much slower, but the files are smaller for the same
+  quality. Install it with `brew install ffmpeg`. The app finds it by itself.
 
-| Status | Meaning |
-|---|---|
-| `replaced` | New video is in Photos, original waits in the delete album |
-| `deleted` | Original was moved to Recently Deleted |
-| `not_worth` | Already well compressed, original kept |
-| `skipped` | A video type we do not touch |
-| `failed` | Error. Retried up to 3 times |
-| `needs_review` | Stopped in the middle of an import. Check Photos for a duplicate. Never retried automatically |
+## Where the app keeps its data
 
-## Encoder choice
+`~/Library/Application Support/iCloudVideoResize/`
 
-- `libx265` (default): software encoder. Slow, but gives the smallest files.
-  Good for a Mac that works in the background.
-- `videotoolbox`: Apple hardware encoder. Much faster, but files are bigger
-  for the same quality.
+- `state.json`: what was done to each video.
+- `work/`: temporary files, removed after each video.
+
+If the app stops while it is adding a video to Photos, that video is marked
+"Check Photos for a duplicate" and is never retried automatically.
 
 ## Development
 
 ```bash
-pip install -e ".[dev]"
-pytest
+swift build
+swift test
 ```
 
-The tests use real `ffmpeg` and a fake Photos library, so they run on any
-system.
+- `Sources/VideoResizeCore`: Photos access, encoding, checks, state.
+- `Sources/VideoResizeApp`: the SwiftUI interface.
+- `Tests`: the tests really encode short videos with the Apple encoder, and
+  use a fake photo library.
 
-## Test status
-
-The encoding, verification, state and pipeline logic are covered by the test
-suite. The code that talks to Photos (`library.py`, with `osxphotos`,
-`photoscript` and PhotoKit) and the launchd script were written without
-access to a Mac and **have not been run on a real Photos library yet**.
-Follow the "First run" steps above with one video before you trust it.
+A GitHub Action builds and tests every push on a macOS runner, and uploads
+the built app as an artifact.
