@@ -174,6 +174,7 @@
 				INFOPLIST_KEY_CFBundleDisplayName = "SD Video Import";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.video";
 				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "The app adds the videos you import from the card to your photo library.";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "The app reads your videos, adds the smaller versions, and deletes the originals only when you ask.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -201,6 +202,7 @@
 				INFOPLIST_KEY_CFBundleDisplayName = "SD Video Import";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.video";
 				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "The app adds the videos you import from the card to your photo library.";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "The app reads your videos, adds the smaller versions, and deletes the originals only when you ask.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;

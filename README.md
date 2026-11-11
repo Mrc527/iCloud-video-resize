@@ -5,7 +5,7 @@ resolution, so they take less iCloud space and less time to upload.
 
 | App | Where | What it does |
 |---|---|---|
-| **SD Video Import** | iPad, iPhone | Imports videos from an SD card and makes them smaller **before** they go into Photos. iCloud uploads only the small version. |
+| **SD Video Import** | iPad, iPhone | Imports videos from an SD card and makes them smaller **before** they go into Photos. iCloud uploads only the small version. It can also make smaller the videos already in the library, like the Mac app. |
 | **iCloud Video Resize** | Mac | Makes smaller the videos that are **already** in your iCloud Photos library. |
 
 Both use the same code to encode and to check the result.
@@ -54,6 +54,23 @@ change the photos you already have.
 - **Log profiles** (S-Log, C-Log, V-Log) are kept as they are, not converted.
 - If a video cannot be re-encoded for an unexpected reason, it is marked as
   failed and is not added. You can try again, or import it with Photos.
+
+## Videos already in Photos
+
+The **Photos library** tab does on the iPad what the Mac app does: it lists
+the videos of your library, re-encodes the ones worth it, adds the new
+version, and parks the original in the album
+`Video Resize: originals to delete`. The originals are deleted only when you
+press **Delete originals**. The steps, the videos left alone and the limits
+are the same as in the Mac section below.
+
+Two differences from the Mac:
+
+- Only the Apple encoder is used. ffmpeg cannot run on an iPad.
+- The app must stay on screen while it works, as for the SD card import.
+
+This tab needs **full access** to Photos. The app asks for it only when you
+open the tab. If you use only the SD card tab, the app can only add videos.
 
 ## Build and install
 

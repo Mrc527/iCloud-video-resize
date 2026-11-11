@@ -321,6 +321,16 @@ struct SettingsView: View {
                 } footer: {
                     Text("Slower, but a damaged video is never added to Photos.")
                 }
+                Section {
+                    Stepper("Minimum size: \(Int(model.settings.minSizeMB)) MB",
+                            value: $model.settings.minSizeMB, in: 0...2000, step: 10)
+                    Stepper("Minimum age: \(model.settings.minAgeDays) days",
+                            value: $model.settings.minAgeDays, in: 0...3650)
+                } header: {
+                    Text("Photos library")
+                } footer: {
+                    Text("Videos in the library that are smaller or newer than this are left alone.")
+                }
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
