@@ -89,7 +89,7 @@ can install it with the TestFlight app. Everything can be done in a browser.
 One-time setup:
 
 1. On developer.apple.com, under Identifiers, register the App ID
-   `com.github.mrc527.sd-video-import`.
+   `ch.visin.sdvideoimport`.
 2. On appstoreconnect.apple.com, under Apps, create a new iOS app with that
    bundle ID.
 3. Under Users and Access, Integrations, create an App Store Connect API key

@@ -7,7 +7,7 @@
     <key>CFBundleDisplayName</key>
     <string>iCloud Video Resize</string>
     <key>CFBundleIdentifier</key>
-    <string>com.github.mrc527.icloud-video-resize</string>
+    <string>ch.visin.icloudvideoresize</string>
     <key>CFBundleExecutable</key>
     <string>VideoResizeApp</string>
     <key>CFBundlePackageType</key>
