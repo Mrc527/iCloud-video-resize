@@ -81,6 +81,29 @@ You need a Mac with Xcode 16 or newer and an Apple Developer account.
    choose your team.
 3. Connect the iPad, choose it as the destination, and press Run.
 
+## Install without a Mac (TestFlight)
+
+The **TestFlight** GitHub Action builds, signs and uploads the app, so you
+can install it with the TestFlight app. Everything can be done in a browser.
+
+One-time setup:
+
+1. On developer.apple.com, under Identifiers, register the App ID
+   `com.github.mrc527.sd-video-import`.
+2. On appstoreconnect.apple.com, under Apps, create a new iOS app with that
+   bundle ID.
+3. Under Users and Access, Integrations, create an App Store Connect API key
+   with the **Admin** role. Download the `.p8` file and note the Key ID and
+   the Issuer ID.
+4. In this repository, under Settings, Secrets and variables, Actions, add
+   four secrets: `ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_KEY_P8` (the whole text
+   of the `.p8` file) and `APPLE_TEAM_ID`.
+
+Each time you want a new build: open Actions, choose **TestFlight**, press
+**Run workflow**. After some minutes the build appears in App Store Connect
+under TestFlight. Add yourself to an internal testing group and install it
+from the TestFlight app.
+
 # iCloud Video Resize (Mac)
 
 ## How it works
