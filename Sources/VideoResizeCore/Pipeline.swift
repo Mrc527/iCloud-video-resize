@@ -33,6 +33,7 @@ public final class Pipeline: @unchecked Sendable {
 
         do {
             var record = try await run(item, settings: settings, work: work, progress: progress)
+            if record.status != .replaced, let done = doneElsewhere(item.id) { return done }
             record.attempts = attempts
             store.set(record, for: item.id)
             return record
@@ -42,6 +43,7 @@ public final class Pipeline: @unchecked Sendable {
             let current = store.record(for: item.id)
             let importing = current?.status == .importing
             if error is CancellationError && !importing { return nil }
+            if !importing, let done = doneElsewhere(item.id) { return done }
 
             var record = current ?? Record(status: .failed, filename: item.filename)
             record.status = importing ? .needsReview : .failed
@@ -70,6 +72,12 @@ public final class Pipeline: @unchecked Sendable {
             return Record(status: .skipped, filename: item.filename, originalSize: info.fileSize,
                           detail: "More than one video track (cinematic or spatial video)")
         }
+        do {
+            try Carryover.check(source)
+        } catch MediaError.unsupported(let what) {
+            return Record(status: .skipped, filename: item.filename, originalSize: info.fileSize,
+                          detail: "Kept as it is: a new file could not carry \(what)")
+        }
         // Now the real frame rate and bit rate are known: check again.
         let expected = Bitrate.expectedSaving(sourceBitrate: info.videoBitrate, width: info.width,
                                               height: info.height, fps: info.fps,
@@ -80,21 +88,17 @@ public final class Pipeline: @unchecked Sendable {
                                          info.videoBitrate / 1_000_000))
         }
 
-        // Same name as the original, so the video looks the same in Photos.
         let outputDirectory = work.appendingPathComponent("out")
         try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
-        let name = source.pathExtension.lowercased() == "mov"
-            ? source.lastPathComponent
-            : source.deletingPathExtension().lastPathComponent + ".mov"
-        let destination = outputDirectory.appendingPathComponent(name)
+        let destination = outputDirectory.appendingPathComponent(Reencode.outputName(for: source))
 
         progress(.encoding, 0)
-        try await transcoder.transcode(source: source, destination: destination, info: info,
-                                       quality: settings.quality) { progress(.encoding, $0) }
+        try await Reencode.run(transcoder, source: source, destination: destination, info: info,
+                               quality: settings.quality) { progress(.encoding, $0) }
         try Task.checkCancellation()
 
         progress(.verifying, 0)
-        let output = try await Verifier.verify(source: info, output: destination,
+        let output = try await Verifier.verify(source: info, output: destination, original: source,
                                                fullDecode: settings.fullVerify)
         let saving = 100 * (1 - Double(output.fileSize) / Double(max(info.fileSize, 1)))
         if saving < settings.minSavingPercent {
@@ -103,6 +107,9 @@ public final class Pipeline: @unchecked Sendable {
                           detail: String(format: "Saving too small (%.0f%%)", saving))
         }
         try Task.checkCancellation()
+
+        // Another device may have replaced this video while it was encoded here.
+        if let done = doneElsewhere(item.id) { return done }
 
         // From here Photos is changed. The intent is saved first, and the work
         // is no longer cancelled half way.
@@ -121,6 +128,13 @@ public final class Pipeline: @unchecked Sendable {
         record.detail = String(format: "Saved %.0f%%", saving)
         record.updatedAt = Date()
         return record
+    }
+
+    /// The record of a video that another device replaced while this one worked on it.
+    /// Policy never starts a replaced video, so such a record came through iCloud.
+    private func doneElsewhere(_ id: String) -> Record? {
+        guard let current = store.record(for: id), current.status.hasNewVideo else { return nil }
+        return current
     }
 
     private static func transcoder(for settings: AppSettings) throws -> Transcoder {
@@ -174,6 +188,39 @@ public final class Pipeline: @unchecked Sendable {
             }
         }
         return (safe.count, heldBack)
+    }
+
+    /// Undo a replacement: delete the new video and take the original out of the album.
+    /// `ids` may name originals or their new videos. Only videos whose new video is on this
+    /// device are restored: a new video still on its way through iCloud would stay.
+    public func restore(_ ids: Set<String>) async throws -> (restored: Int, notHere: Int) {
+        let byNewVideo = Dictionary(store.records.compactMap { id, record in
+            record.newIdentifier.map { ($0, id) }
+        }, uniquingKeysWith: { first, _ in first })
+        let replaced = Set(ids.map { byNewVideo[$0] ?? $0 }).filter {
+            store.record(for: $0)?.status == .replaced && library.exists($0)
+        }
+        // Without its identifier the new video has not reached this device yet. With it but
+        // missing, the person deleted it: the original only leaves the album.
+        let originals = replaced.filter { store.record(for: $0)?.newIdentifier != nil }
+        guard !originals.isEmpty else { return (0, replaced.count) }
+
+        // One confirmation for all the new videos. If the person says no, nothing changes.
+        let newVideos = originals.compactMap { store.record(for: $0)?.newIdentifier }
+            .filter(library.exists)
+        if !newVideos.isEmpty { try await library.delete(newVideos) }
+
+        for id in originals {
+            try await library.unpark(original: id, albumTitle: Self.albumTitle)
+            guard var record = store.record(for: id) else { continue }
+            record.status = .restored
+            record.newIdentifier = nil
+            record.newSize = nil
+            record.detail = "Restored: the new video was deleted"
+            record.updatedAt = Date()
+            store.set(record, for: id)
+        }
+        return (originals.count, replaced.count - originals.count)
     }
 
     private func mark(_ id: String, _ record: Record, detail: String) {

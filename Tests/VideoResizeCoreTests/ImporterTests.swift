@@ -6,6 +6,8 @@ final class FakeSink: PhotoSink, @unchecked Sendable {
         let name: String
         let size: Int64
         let date: Date?
+        var latitude: Double?
+        var longitude: Double?
     }
     var added: [Added] = []
     var fail = false
@@ -14,7 +16,8 @@ final class FakeSink: PhotoSink, @unchecked Sendable {
              longitude: Double?) async throws -> String {
         if fail { throw LibraryError.importFailed }
         let size = Int64((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
-        added.append(Added(name: file.lastPathComponent, size: size, date: creationDate))
+        added.append(Added(name: file.lastPathComponent, size: size, date: creationDate,
+                           latitude: latitude, longitude: longitude))
         return "ID-\(added.count)"
     }
 }
@@ -88,7 +91,7 @@ final class ImporterTests: TempDirectoryTestCase {
 
         XCTAssertEqual(entry?.outcome, .reencoded, entry?.detail ?? "")
         XCTAssertEqual(sink.added.count, 1)
-        XCTAssertEqual(sink.added.first?.name, "C0001.mov")
+        XCTAssertEqual(sink.added.first?.name, "C0001.MP4", "same name and type as on the card")
         XCTAssertLessThan(sink.added.first?.size ?? .max, video.fileSize)
         XCTAssertLessThan(entry?.newSize ?? .max, entry?.originalSize ?? 0)
 
@@ -117,6 +120,22 @@ final class ImporterTests: TempDirectoryTestCase {
         XCTAssertEqual(sink.added.first?.name, "C0001.MP4")
         XCTAssertEqual(sink.added.first?.size, video.fileSize)
         XCTAssertTrue(FileManager.default.fileExists(atPath: video.url.path))
+    }
+
+    func testADroneVideoIsReencodedWithAllItsDataAndPosition() async throws {
+        _ = try await prepare()
+        let url = card.appendingPathComponent("DJI_0001.MOV")
+        try await Sample.makeDroneVideo(at: url)
+        let video = try XCTUnwrap(SourceScanner.scan(folder: card).videos
+            .first { $0.filename == "DJI_0001.MOV" })
+
+        let entry = await importer.importVideo(video, settings: AppSettings()) { _, _ in }
+
+        XCTAssertEqual(entry?.outcome, .reencoded, entry?.detail ?? "")
+        XCTAssertEqual(sink.added.first?.name, "DJI_0001.MOV")
+        // Apple's frameworks cannot read ©xyz: the position is read from the user data.
+        XCTAssertEqual(sink.added.first?.latitude ?? 0, 46.0037, accuracy: 0.0001)
+        XCTAssertEqual(sink.added.first?.longitude ?? 0, 8.9511, accuracy: 0.0001)
     }
 
     func testBrokenFileIsNotAdded() async throws {

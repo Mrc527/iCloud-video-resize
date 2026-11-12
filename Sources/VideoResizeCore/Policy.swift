@@ -47,6 +47,8 @@ public enum Policy {
                 return .leave("Failed \(record.attempts) times: \(record.detail)")
             case .replaced:
                 return .leave("Replaced. The original waits for deletion")
+            case .restored:
+                break  // as if never processed
             case .needsReview:
                 return .leave("Check Photos for a duplicate: \(record.detail)")
             case .importing, .deleted, .notWorth, .skipped:

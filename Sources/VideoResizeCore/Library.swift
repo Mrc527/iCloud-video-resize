@@ -1,3 +1,4 @@
+import AVFoundation
 import CoreLocation
 import Foundation
 import Photos
@@ -14,6 +15,8 @@ public protocol VideoLibrary: Sendable {
     func exists(_ id: String) -> Bool
     /// Put the original in an album, where it waits for deletion.
     func park(original id: String, albumTitle: String) async throws
+    /// Take the original out of that album again.
+    func unpark(original id: String, albumTitle: String) async throws
     /// Move videos to Recently Deleted. macOS asks the user to confirm.
     func delete(_ ids: [String]) async throws
 }
@@ -45,7 +48,9 @@ public final class PhotoKitLibrary: VideoLibrary, @unchecked Sendable {
             let options = PHFetchOptions()
             options.includeAssetSourceTypes = [.typeUserLibrary]  // no shared albums
             options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+            Self.fetchCameraInBatch(options)
             let assets = PHAsset.fetchAssets(with: .video, options: options)
+            let parked = Self.identifiers(inAlbum: Pipeline.albumTitle)
 
             var items: [VideoItem] = []
             items.reserveCapacity(assets.count)
@@ -60,10 +65,27 @@ public final class PhotoKitLibrary: VideoLibrary, @unchecked Sendable {
                     width: asset.pixelWidth,
                     height: asset.pixelHeight,
                     fileSize: Self.fileSize(video),
-                    skipReason: Self.skipReason(asset, resources)))
+                    skipReason: parked.contains(asset.localIdentifier)
+                        ? "Waits for deletion in the album \"\(Pipeline.albumTitle)\""
+                        : Self.skipReason(asset, resources),
+                    device: Self.camera(asset)))
             }
             return items
         }.value
+    }
+
+    /// The album is shared through iCloud, but each device keeps its own records.
+    /// Without this, another device would re-encode an original that waits for deletion.
+    private static func identifiers(inAlbum title: String) -> Set<String> {
+        var identifiers = Set<String>()
+        PHAssetCollection.fetchAssetCollections(with: .album, subtype: .albumRegular, options: nil)
+            .enumerateObjects { album, _, _ in
+                guard album.localizedTitle == title else { return }
+                PHAsset.fetchAssets(in: album, options: nil).enumerateObjects { asset, _, _ in
+                    identifiers.insert(asset.localIdentifier)
+                }
+            }
+        return identifiers
     }
 
     /// Kinds of video where a re-import would lose something.
@@ -87,6 +109,38 @@ public final class PhotoKitLibrary: VideoLibrary, @unchecked Sendable {
     private static func fileSize(_ resource: PHAssetResource) -> Int64 {
         guard resource.responds(to: NSSelectorFromString("fileSize")) else { return 0 }
         return (resource.value(forKey: "fileSize") as? NSNumber)?.int64Value ?? 0
+    }
+
+    // PhotoKit has no public way to ask for the camera either. These keys are not
+    // documented: they hold what the Info panel of Photos shows. If they go away the
+    // camera is simply unknown.
+    private static let cameraKey = "photosInfoPanelExtendedProperties"
+
+    /// Read the camera with the fetch: one query in all instead of one per video.
+    private static func fetchCameraInBatch(_ options: PHFetchOptions) {
+        let add = NSSelectorFromString("addFetchPropertySets:")
+        guard let properties = NSClassFromString("PHAssetPhotosInfoPanelExtendedProperties") as AnyObject?,
+              properties.responds(to: NSSelectorFromString("propertySetName")),
+              let set = properties.value(forKey: "propertySetName") as? String,
+              options.responds(to: add)
+        else { return }
+        _ = options.perform(add, with: [set])
+    }
+
+    private static func camera(_ asset: PHAsset) -> String? {
+        guard asset.responds(to: NSSelectorFromString(cameraKey)),
+              let info = asset.value(forKey: cameraKey) as? NSObject
+        else { return nil }
+        func text(_ key: String) -> String? {
+            guard info.responds(to: NSSelectorFromString(key)),
+                  let value = info.value(forKey: key) as? String
+            else { return nil }
+            let trimmed = value.trimmingCharacters(in: .whitespaces)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        if let formatted = text("formattedCameraModel") { return formatted }
+        let parts = [text("cameraMake"), text("cameraModel")].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: " ")
     }
 
     private func asset(_ id: String) throws -> PHAsset {
@@ -146,6 +200,49 @@ public final class PhotoKitLibrary: VideoLibrary, @unchecked Sendable {
         PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).count > 0
     }
 
+    /// The camera named in each original file, for the videos whose original is on this
+    /// device; "" when the file names none. Nothing is downloaded: the others are left out.
+    public func cameraNames(_ ids: [String]) async -> [String: String] {
+        var assets: [PHAsset] = []
+        PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
+            .enumerateObjects { asset, _, _ in assets.append(asset) }
+        var names: [String: String] = [:]
+        for asset in assets {
+            let options = PHVideoRequestOptions()
+            options.isNetworkAccessAllowed = false
+            options.version = .original
+            options.deliveryMode = .highQualityFormat
+            // The file is read while Photos keeps it open for us, in the handler.
+            let name: String? = await withCheckedContinuation { continuation in
+                PHImageManager.default().requestAVAsset(forVideo: asset, options: options) { video, _, _ in
+                    continuation.resume(returning: (video as? AVURLAsset).map {
+                        CameraName.fromFile($0.url) ?? ""
+                    })
+                }
+            }
+            if let name { names[asset.localIdentifier] = name }
+        }
+        return names
+    }
+
+    /// For watching a video. Streams it from iCloud when the original is not on this device.
+    public func playerItem(for id: String) async throws -> AVPlayerItem {
+        let video = try asset(id)
+        let options = PHVideoRequestOptions()
+        options.isNetworkAccessAllowed = true
+        options.deliveryMode = .automatic
+        return try await withCheckedThrowingContinuation { continuation in
+            PHImageManager.default().requestPlayerItem(forVideo: video, options: options) { item, info in
+                if let item {
+                    continuation.resume(returning: item)
+                } else {
+                    continuation.resume(throwing: info?[PHImageErrorKey] as? Error
+                                        ?? LibraryError.noVideoResource)
+                }
+            }
+        }
+    }
+
     public func park(original id: String, albumTitle: String) async throws {
         let original = try asset(id)
 
@@ -171,11 +268,46 @@ public final class PhotoKitLibrary: VideoLibrary, @unchecked Sendable {
         }
     }
 
+    public func unpark(original id: String, albumTitle: String) async throws {
+        let original = try asset(id)
+        var albums: [PHAssetCollection] = []  // two devices may each have made one
+        PHAssetCollection.fetchAssetCollections(with: .album, subtype: .albumRegular, options: nil)
+            .enumerateObjects { album, _, _ in
+                if album.localizedTitle == albumTitle { albums.append(album) }
+            }
+        guard !albums.isEmpty else { return }
+        let targets = albums
+        try await PHPhotoLibrary.shared().performChanges {
+            for album in targets {
+                PHAssetCollectionChangeRequest(for: album)?.removeAssets([original] as NSArray)
+            }
+        }
+    }
+
     public func delete(_ ids: [String]) async throws {
         let assets = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
         try await PHPhotoLibrary.shared().performChanges {
             PHAssetChangeRequest.deleteAssets(assets)
         }
+    }
+}
+
+extension PhotoKitLibrary: IdentifierMapping {
+    public func cloudIdentifiers(for localIdentifiers: [String]) -> [String: String] {
+        guard !localIdentifiers.isEmpty else { return [:] }
+        return PHPhotoLibrary.shared().cloudIdentifierMappings(forLocalIdentifiers: localIdentifiers)
+            .compactMapValues { try? $0.get().stringValue }
+    }
+
+    public func localIdentifiers(for cloudIdentifiers: [String]) -> [String: String] {
+        guard !cloudIdentifiers.isEmpty else { return [:] }
+        var result: [String: String] = [:]
+        let mappings = PHPhotoLibrary.shared().localIdentifierMappings(
+            for: cloudIdentifiers.map(PHCloudIdentifier.init(stringValue:)))
+        for (cloud, local) in mappings {
+            if let local = try? local.get() { result[cloud.stringValue] = local }
+        }
+        return result
     }
 }
 

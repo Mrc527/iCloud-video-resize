@@ -41,6 +41,14 @@ public final class StateStore: @unchecked Sendable {
         save()
     }
 
+    /// Set several records, with one write of the file.
+    public func merge(_ records: [String: Record]) {
+        guard !records.isEmpty else { return }
+        lock.lock(); defer { lock.unlock() }
+        stored.records.merge(records) { $1 }
+        save()
+    }
+
     /// Records left in `importing` mean the app stopped during an import.
     /// They are flagged for a person and never retried automatically.
     @discardableResult

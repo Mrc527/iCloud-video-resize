@@ -1,3 +1,4 @@
+import AVKit
 import SwiftUI
 import VideoResizeCore
 
@@ -5,6 +6,9 @@ struct ContentView: View {
     @EnvironmentObject private var model: AppModel
     @State private var filter: Filter = .todo
     @State private var confirmDelete = false
+    @State private var selection = Set<String>()
+    @State private var playing: VideoItem?
+    @State private var restoring: Set<String> = []
 
     var body: some View {
         Group {
@@ -15,20 +19,45 @@ struct ContentView: View {
                 AccessDeniedView()
             case .granted:
                 VStack(spacing: 0) {
-                    SummaryBar()
+                    SummaryBar(selection: selection)
                     ProgressBar(progress: model.progress)
                     Divider()
-                    VideoTable(rows: model.rows(filter))
+                    VideoTable(rows: model.rows(filter), selection: $selection,
+                               play: { id in playing = model.items.first { $0.id == id } },
+                               encode: { model.start(only: $0) },
+                               restore: { restoring = $0 },
+                               canChange: !model.isScanning && !model.isRunning)
                 }
             }
         }
         .frame(minWidth: 900, minHeight: 480)
         .toolbar { toolbar }
+        .onChange(of: filter) { selection = [] }
+        .onChange(of: model.isScanning) {
+            // After each scan, also the one that ends a run: keep only what is still to do.
+            if !model.isScanning && !model.isRunning {
+                selection.formIntersection(model.queue.map(\.id))
+            }
+        }
+        .sheet(item: $playing) { PlayerSheet(item: $0) }
         .task { await model.bootstrap() }
         .alert("iCloud Video Resize", isPresented: messageShown) {
             Button("OK") {}
         } message: {
             Text(model.message ?? "")
+        }
+        .confirmationDialog(
+            "Restore the original of the selected video(s)?",
+            isPresented: Binding(get: { !restoring.isEmpty }, set: { if !$0 { restoring = [] } })
+        ) {
+            Button("Restore originals", role: .destructive) {
+                let ids = restoring
+                Task { await model.restore(ids) }
+            }
+        } message: {
+            Text("The new smaller videos move to Recently Deleted. The originals leave the album "
+                + "\"\(Pipeline.albumTitle)\" and come back to the To do list. "
+                + "macOS will ask you to confirm the deletion once more.")
         }
         .confirmationDialog(
             "Delete \(model.waitingForDeletion) original video(s)?",
@@ -74,11 +103,13 @@ struct ContentView: View {
                 .disabled(model.isStopping)
             } else {
                 Button {
-                    model.start()
+                    model.start(only: selection)
                 } label: {
                     Label("Start", systemImage: "play.fill")
                 }
-                .help("Re-encode the videos in the To do list")
+                .help(selection.isEmpty
+                      ? "Re-encode all the videos in the To do list"
+                      : "Re-encode the selected videos that are in the To do list")
                 .disabled(model.access != .granted || model.isScanning)
             }
 
@@ -99,12 +130,18 @@ struct ContentView: View {
 
 struct SummaryBar: View {
     @EnvironmentObject private var model: AppModel
+    let selection: Set<String>
 
     var body: some View {
         let queue = model.queue
         HStack(spacing: 24) {
             stat("Videos", "\(model.items.count)")
             stat("To do", "\(queue.count)  (\(Format.bytes(queue.reduce(0) { $0 + $1.fileSize })))")
+            if !selection.isEmpty {
+                let chosen = queue.filter { selection.contains($0.id) }
+                stat("Selected", "\(selection.count), \(chosen.count) to do  "
+                    + "(\(Format.bytes(chosen.reduce(0) { $0 + $1.fileSize })))")
+            }
             stat("Space saved", Format.bytes(model.savedBytes))
             stat("Originals to delete", "\(model.waitingForDeletion)")
             Spacer()
@@ -149,22 +186,101 @@ struct ProgressBar: View {
 
 struct VideoTable: View {
     let rows: [Row]
+    @Binding var selection: Set<String>
+    let play: (String) -> Void
+    let encode: (Set<String>) -> Void
+    let restore: (Set<String>) -> Void
+    /// False while scanning or working.
+    let canChange: Bool
 
     var body: some View {
-        Table(rows) {
+        Table(rows, selection: $selection) {
             TableColumn("Name", value: \.name)
             TableColumn("Date", value: \.date).width(min: 80, ideal: 100)
+            TableColumn("Device", value: \.device).width(min: 80, ideal: 140)
             TableColumn("Resolution", value: \.resolution).width(min: 80, ideal: 100)
             TableColumn("Length", value: \.length).width(min: 50, ideal: 60)
             TableColumn("Size", value: \.size).width(min: 60, ideal: 80)
             TableColumn("Bit rate", value: \.bitrate).width(min: 80, ideal: 100)
             TableColumn("Status", value: \.status).width(min: 150, ideal: 280)
         }
+        .contextMenu(forSelectionType: String.self) { ids in
+            Button("Play") { ids.first.map(play) }
+                .disabled(ids.count != 1)
+            Button("Re-encode") { encode(ids) }
+                .disabled(ids.isEmpty || !canChange)
+            Button("Restore original…") { restore(ids) }
+                .disabled(ids.isEmpty || !canChange)
+        } primaryAction: { ids in
+            // Double click.
+            if ids.count == 1 { ids.first.map(play) }
+        }
         .overlay {
             if rows.isEmpty {
                 Text("No videos in this list").foregroundStyle(.secondary)
             }
         }
+    }
+}
+
+/// AVKit's player view. SwiftUI's VideoPlayer crashed: it needs AVKit loaded, and
+/// nothing else made the app link AVKit.
+struct PlayerView: NSViewRepresentable {
+    let player: AVPlayer
+
+    func makeNSView(context: Context) -> AVPlayerView {
+        let view = AVPlayerView()
+        view.player = player
+        return view
+    }
+
+    func updateNSView(_ view: AVPlayerView, context: Context) {
+        view.player = player
+    }
+}
+
+/// Plays a video of the library. Photos streams it from iCloud when needed.
+struct PlayerSheet: View {
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    let item: VideoItem
+    @State private var player: AVPlayer?
+    @State private var failure: String?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ZStack {
+                Color.black
+                if let player {
+                    PlayerView(player: player)
+                } else if let failure {
+                    Text(failure).foregroundStyle(.white)
+                } else {
+                    ProgressView().controlSize(.large)
+                }
+            }
+            .frame(minWidth: 800, idealWidth: 960, minHeight: 450, idealHeight: 540)
+            HStack {
+                Text(item.filename).font(.headline)
+                if let device = item.device {
+                    Text(device).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Close") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding(12)
+        }
+        .task {
+            do {
+                let player = AVPlayer(playerItem: try await model.playerItem(for: item))
+                self.player = player
+                player.play()
+            } catch {
+                failure = "Cannot play this video: \(error.localizedDescription)"
+            }
+        }
+        .onDisappear { player?.pause() }
     }
 }
 
@@ -218,6 +334,12 @@ struct SettingsView: View {
             Section("Safety") {
                 Toggle("Decode the whole new video before using it",
                        isOn: $model.settings.fullVerify)
+            }
+            Section("Other devices") {
+                Text(model.isSynced
+                     ? "What this app did is shared through iCloud with your iPad and iPhone."
+                     : "Not shared with your other devices: this build is not signed with a team.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)

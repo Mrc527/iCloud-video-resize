@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import SwiftUI
 import VideoResizeCore
@@ -20,6 +21,7 @@ struct Row: Identifiable {
     let id: String
     let name: String
     let date: String
+    let device: String
     let resolution: String
     let length: String
     let size: String
@@ -35,9 +37,9 @@ final class ProgressModel: ObservableObject {
     @Published var phase: Phase = .downloading
     @Published var fraction: Double = 0
 
-    func begin(_ filename: String) {
+    func begin(_ filename: String, phase: Phase = .downloading) {
         self.filename = filename
-        phase = .downloading
+        self.phase = phase
         fraction = 0
     }
 
@@ -69,7 +71,15 @@ final class AppModel: ObservableObject {
     private let store: StateStore
     private let library = PhotoKitLibrary()
     private let pipeline: Pipeline
+    /// nil when this build cannot use iCloud: it is not signed with a team.
+    private let sync: RecordSync?
     private var worker: Task<Void, Never>?
+    private let cameras: CameraCache
+    private var cameraReader: Task<Void, Never>?
+    /// Changes when camera names were read, so that the table shows them.
+    @Published private var camerasRead = 0
+
+    var isSynced: Bool { sync != nil }
 
     init() {
         let fileManager = FileManager.default
@@ -81,6 +91,13 @@ final class AppModel: ObservableObject {
 
         store = StateStore(url: support.appendingPathComponent("state.json"))
         pipeline = Pipeline(library: library, store: store, workDirectory: work)
+        cameras = CameraCache(url: support.appendingPathComponent("cameras.json"))
+        let cloud = ICloudStore.make()
+        if let cloud {
+            sync = RecordSync(store: store, shared: cloud, identifiers: library)
+        } else {
+            sync = nil
+        }
         settings = AppSettings.load()
 
         let interrupted = store.recoverInterrupted()
@@ -88,6 +105,9 @@ final class AppModel: ObservableObject {
         if interrupted > 0 {
             message = "\(interrupted) video(s) were being added to Photos when the app stopped. "
                 + "Look in Photos for duplicates. They are listed under \"Left alone\"."
+        }
+        cloud?.observe { [weak self] keys in
+            Task { @MainActor in await self?.otherDeviceChanged(keys) }
         }
     }
 
@@ -139,6 +159,7 @@ final class AppModel: ObservableObject {
                 id: item.id,
                 name: item.filename,
                 date: item.creationDate.map { Format.date.string(from: $0) } ?? "",
+                device: item.device ?? cameraName(for: item) ?? "",
                 resolution: "\(item.width) x \(item.height)",
                 length: Format.length(item.duration),
                 size: Format.bytes(item.fileSize),
@@ -161,22 +182,73 @@ final class AppModel: ObservableObject {
         defer { isScanning = false }
         do {
             items = try await library.listVideos()
+            readCameraNames()
+            if let sync {
+                await Task.detached { sync.pull(); sync.push() }.value
+            }
             records = store.records
         } catch {
             message = "Cannot read the Photos library: \(error.localizedDescription)"
         }
     }
 
-    func start() {
-        guard !isRunning else { return }
+    /// Photos knows the camera only from Apple's tags. For the other videos it is read from
+    /// the file when the original is on this Mac, else guessed from the name.
+    private func cameraName(for item: VideoItem) -> String? {
+        if let name = cameras.name(for: item.id), !name.isEmpty { return name }
+        return CameraName.fromName(item.filename)
+    }
+
+    private func readCameraNames() {
+        cameraReader?.cancel()
+        let toRead = items.filter { $0.device == nil && cameras.name(for: $0.id) == nil }.map(\.id)
+        guard !toRead.isEmpty else { return }
+        let library = library
+        let cameras = cameras
+        cameraReader = Task {
+            for start in stride(from: 0, to: toRead.count, by: 20) {
+                if Task.isCancelled { return }
+                let found = await library.cameraNames(Array(toRead[start..<min(start + 20, toRead.count)]))
+                cameras.merge(found)
+                if found.values.contains(where: { !$0.isEmpty }) { self.camerasRead += 1 }
+            }
+        }
+    }
+
+    /// Another device changed the shared records.
+    private func otherDeviceChanged(_ keys: [String]) async {
+        guard let sync, access == .granted else { return }
+        let changed = await Task.detached {
+            let changed = sync.pull(keys: keys)
+            sync.push()  // puts back what the other device's write to the same key dropped
+            return changed
+        }.value
+        if changed { records = store.records }
+    }
+
+    private func pushRecords() {
+        guard let sync else { return }
+        Task.detached(priority: .utility) { sync.push() }
+    }
+
+    func playerItem(for item: VideoItem) async throws -> AVPlayerItem {
+        try await library.playerItem(for: item.id)
+    }
+
+    /// Re-encode the videos of the To do list. With `only`, just those of them.
+    func start(only ids: Set<String> = []) {
+        // While scanning, the records from the other devices may not be merged yet.
+        guard !isRunning, !isScanning else { return }
         if settings.encoder == .ffmpeg, FFmpegTranscoder.locate(custom: settings.ffmpegPath) == nil {
             message = "ffmpeg was not found. Install it with \"brew install ffmpeg\", "
                 + "or choose the Apple encoder in Settings."
             return
         }
-        let videos = queue
+        let videos = ids.isEmpty ? queue : queue.filter { ids.contains($0.id) }
         guard !videos.isEmpty else {
-            message = "There is nothing to do."
+            message = ids.isEmpty
+                ? "There is nothing to do."
+                : "None of the selected videos is in the To do list."
             return
         }
         isRunning = true
@@ -193,11 +265,14 @@ final class AppModel: ObservableObject {
 
             for item in videos {
                 if Task.isCancelled { break }
+                // Another device may have done it since the list was made.
+                guard self.decision(for: item, outputs: self.outputs) == .process else { continue }
                 progress.begin(item.filename)
                 await pipeline.process(item, settings: settings) { phase, fraction in
                     Task { @MainActor in progress.update(phase, fraction) }
                 }
                 self.records = self.store.records
+                self.pushRecords()
             }
             progress.end()
             self.isRunning = false
@@ -213,7 +288,29 @@ final class AppModel: ObservableObject {
         worker?.cancel()
     }
 
+    /// Delete the new videos and bring back the originals. `ids` may name either.
+    func restore(_ ids: Set<String>) async {
+        guard !isRunning else { return }
+        do {
+            let result = try await pipeline.restore(ids)
+            var text = result.restored == 0 && result.notHere == 0
+                ? "None of the selected videos was replaced by this app."
+                : "\(result.restored) original(s) restored. The new videos are in Recently Deleted."
+            if result.notHere > 0 {
+                text += " \(result.notHere) not restored: their new video is not on this Mac "
+                    + "(iCloud may still be bringing it). Try again later."
+            }
+            message = text
+        } catch {
+            message = "The restore stopped: \(error.localizedDescription)"
+        }
+        records = store.records
+        pushRecords()
+        await scan()
+    }
+
     func deleteOriginals() async {
+        defer { pushRecords() }
         do {
             let result = try await pipeline.deleteOriginals()
             records = store.records
@@ -235,6 +332,13 @@ enum Format {
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
         formatter.timeStyle = .none
+        return formatter
+    }()
+
+    static let dateTime: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
         return formatter
     }()
 

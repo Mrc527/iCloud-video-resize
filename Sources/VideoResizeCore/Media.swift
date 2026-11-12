@@ -39,6 +39,8 @@ public struct MediaInfo: Equatable, Sendable {
     public var captureDate: Date? = nil
     public var latitude: Double? = nil
     public var longitude: Double? = nil
+    /// For each audio track: the AAC bit rate it is converted to, 0 when copied as it is.
+    public var aacBitrates: [Int] = []
 }
 
 public enum Probe {
@@ -73,6 +75,11 @@ public enum Probe {
         }
 
         let transfer = description.flatMap { string($0, kCMFormatDescriptionExtension_TransferFunction) }
+        var aacBitrates: [Int] = []
+        for audio in audioTracks {
+            let format = try await audio.load(.formatDescriptions).first
+            aacBitrates.append(NativeTranscoder.aacBitrate(for: format) ?? 0)
+        }
         return MediaInfo(
             duration: duration,
             width: Int(abs(shown.width).rounded()),
@@ -91,7 +98,8 @@ public enum Probe {
             colorMatrix: description.flatMap { string($0, kCMFormatDescriptionExtension_YCbCrMatrix) },
             captureDate: captureDate,
             latitude: place?.latitude,
-            longitude: place?.longitude
+            longitude: place?.longitude,
+            aacBitrates: aacBitrates
         )
     }
 
@@ -163,10 +171,17 @@ public enum ISO6709 {
 }
 
 public enum Verifier {
-    /// Throws unless the new file is a faithful copy of the original.
+    /// Throws unless the new file is a faithful copy of the original. With `original`, it
+    /// also checks that every box, tag and extra track of the original is in the new file.
     @discardableResult
-    public static func verify(source: MediaInfo, output url: URL,
+    public static func verify(source: MediaInfo, output url: URL, original: URL? = nil,
                               fullDecode: Bool) async throws -> MediaInfo {
+        if let original {
+            let missing = try Carryover.differences(original: original, output: url)
+            if !missing.isEmpty {
+                throw MediaError.verification("it would lose " + missing.joined(separator: ", "))
+            }
+        }
         let output = try await Probe.info(url)
 
         guard output.isHEVC else { throw MediaError.verification("the video is not HEVC") }

@@ -4,9 +4,41 @@ import Foundation
 import VideoToolbox
 
 public protocol Transcoder: Sendable {
-    /// Re-encode `source` to HEVC at the same resolution. Audio is copied as is.
+    /// Re-encode `source` to HEVC at the same resolution. Audio is copied as is, except
+    /// uncompressed stereo or mono audio, which becomes AAC. The movie index must end the file.
     func transcode(source: URL, destination: URL, info: MediaInfo, quality: Quality,
                    progress: @escaping @Sendable (Double) -> Void) async throws
+}
+
+/// Encoding as both apps do it: encode, then put back everything else of the original.
+public enum Reencode {
+    /// The name of the new file: the same as the original, so the video looks the same in
+    /// Photos. Types the writer cannot make become .mov.
+    public static func outputName(for source: URL) -> String {
+        if fileType(for: source) != nil { return source.lastPathComponent }
+        return source.deletingPathExtension().lastPathComponent + ".mov"
+    }
+
+    static func fileType(for url: URL) -> AVFileType? {
+        switch url.pathExtension.lowercased() {
+        case "mov": return .mov
+        case "mp4": return .mp4
+        case "m4v": return .m4v
+        default: return nil
+        }
+    }
+
+    public static func run(_ transcoder: Transcoder, source: URL, destination: URL, info: MediaInfo,
+                           quality: Quality,
+                           progress: @escaping @Sendable (Double) -> Void) async throws {
+        let encoded = destination.deletingLastPathComponent()
+            .appendingPathComponent("encoded-" + destination.lastPathComponent)
+        defer { try? FileManager.default.removeItem(at: encoded) }
+        try await transcoder.transcode(source: source, destination: encoded, info: info,
+                                       quality: quality, progress: progress)
+        try Task.checkCancellation()
+        try Carryover.apply(original: source, encoded: encoded, output: destination)
+    }
 }
 
 // MARK: - Apple encoder
@@ -28,10 +60,11 @@ public struct NativeTranscoder: Transcoder {
 
         let reader = try AVAssetReader(asset: asset)
         try? FileManager.default.removeItem(at: destination)
-        let writer = try AVAssetWriter(outputURL: destination, fileType: .mov)
-        // Capture date, GPS, camera model.
+        let writer = try AVAssetWriter(outputURL: destination,
+                                       fileType: Reencode.fileType(for: destination) ?? .mov)
+        // Capture date, GPS, camera model. Carryover then writes them byte for byte.
         writer.metadata = try await asset.loadMetadata(for: .quickTimeMetadata)
-        writer.shouldOptimizeForNetworkUse = true
+        writer.shouldOptimizeForNetworkUse = false  // the index at the end, for Carryover
 
         // Video: decode to raw frames, encode again as HEVC.
         let pixelFormat = info.is10Bit
@@ -81,13 +114,16 @@ public struct NativeTranscoder: Transcoder {
 
         var pairs: [(AVAssetReaderOutput, AVAssetWriterInput, Bool)] = [(videoOutput, videoInput, true)]
 
-        // Audio: copied without re-encoding.
+        // Audio: copied without re-encoding. Uncompressed audio from cameras becomes AAC:
+        // it would be about a tenth of the new file.
         for track in audioTracks {
             let hint = try await track.load(.formatDescriptions).first
-            let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+            let aac = Self.aacSettings(for: hint)
+            let output = AVAssetReaderTrackOutput(
+                track: track, outputSettings: aac == nil ? nil : [AVFormatIDKey: kAudioFormatLinearPCM])
             output.alwaysCopiesSampleData = false
-            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: nil,
-                                           sourceFormatHint: hint)
+            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: aac,
+                                           sourceFormatHint: aac == nil ? hint : nil)
             input.expectsMediaDataInRealTime = false
             guard reader.canAdd(output), writer.canAdd(input) else {
                 throw MediaError.unsupported("audio track")
@@ -176,6 +212,31 @@ public struct NativeTranscoder: Transcoder {
         }
     }
 
+    /// AAC settings for uncompressed mono or stereo audio, nil for anything else.
+    static func aacSettings(for description: CMFormatDescription?) -> [String: Any]? {
+        guard let bitrate = aacBitrate(for: description), let description,
+              let format = CMAudioFormatDescriptionGetStreamBasicDescription(description)?.pointee
+        else { return nil }
+        return [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: format.mSampleRate,
+            AVNumberOfChannelsKey: Int(format.mChannelsPerFrame),
+            AVEncoderBitRateKey: bitrate,
+        ]
+    }
+
+    /// The AAC bit rate for uncompressed mono or stereo audio: 128 kbit/s per channel.
+    /// nil for audio that is copied as it is.
+    static func aacBitrate(for description: CMFormatDescription?) -> Int? {
+        guard let description,
+              let format = CMAudioFormatDescriptionGetStreamBasicDescription(description)?.pointee,
+              format.mFormatID == kAudioFormatLinearPCM,
+              (1...2).contains(format.mChannelsPerFrame),
+              [44_100, 48_000].contains(format.mSampleRate)
+        else { return nil }
+        return 128_000 * Int(format.mChannelsPerFrame)
+    }
+
     private static func colorProperties(_ description: CMFormatDescription?) -> [String: Any]? {
         guard let description,
               let primaries = Probe.string(description, kCMFormatDescriptionExtension_ColorPrimaries),
@@ -235,55 +296,22 @@ public struct FFmpegTranscoder: Transcoder {
         for (flag, value, names) in color {
             if let value, let name = names[value] { args += [flag, name] }
         }
+        args += ["-tag:v", "hvc1", "-c:a", "copy"]  // hvc1: needed by Apple players
+        // The last matching option wins: uncompressed tracks become AAC.
+        for (index, bitrate) in info.aacBitrates.enumerated() where bitrate > 0 {
+            args += ["-c:a:\(index)", "aac", "-b:a:\(index)", "\(bitrate)"]
+        }
+        let mp4 = Reencode.fileType(for: destination) == .mp4 || Reencode.fileType(for: destination) == .m4v
         args += [
-            "-tag:v", "hvc1",       // needed by Apple players
-            "-c:a", "copy",
-            "-map_metadata", "0",   // capture date, GPS, camera model
-            "-movflags", "+faststart+use_metadata_tags",
-            "-f", "mov", destination.path,
+            // ffmpeg writes metadata its own way: Carryover puts back the original's exactly.
+            "-map_metadata", "-1",
+            "-f", mp4 ? "mp4" : "mov", destination.path,  // the index at the end, for Carryover
         ]
         return args
     }
 
     public func transcode(source: URL, destination: URL, info: MediaInfo, quality: Quality,
                           progress: @escaping @Sendable (Double) -> Void) async throws {
-        // ffmpeg writes the Apple metadata keys (capture date, GPS) in moov/udta/meta,
-        // where AVFoundation does not read them. A passthrough copy writes them again.
-        let encoded = destination.deletingLastPathComponent()
-            .appendingPathComponent("ffmpeg-" + destination.lastPathComponent)
-        defer { try? FileManager.default.removeItem(at: encoded) }
-        try await encode(source: source, destination: encoded, info: info, quality: quality,
-                         progress: progress)
-        try await Self.copy(encoded, to: destination, metadataFrom: source)
-        progress(1)
-    }
-
-    private static func copy(_ encoded: URL, to destination: URL, metadataFrom source: URL) async throws {
-        let metadata = try await AVURLAsset(url: source).loadMetadata(for: .quickTimeMetadata)
-        guard let export = AVAssetExportSession(asset: AVURLAsset(url: encoded),
-                                                presetName: AVAssetExportPresetPassthrough)
-        else { throw MediaError.encodingFailed("cannot copy the metadata") }
-        try? FileManager.default.removeItem(at: destination)
-        export.outputURL = destination
-        export.outputFileType = .mov
-        export.metadata = metadata
-        export.shouldOptimizeForNetworkUse = true
-        await withTaskCancellationHandler {
-            await export.export()
-        } onCancel: {
-            export.cancelExport()
-        }
-        if Task.isCancelled {
-            try? FileManager.default.removeItem(at: destination)
-            throw CancellationError()
-        }
-        guard export.status == .completed else {
-            throw MediaError.encodingFailed(export.error?.localizedDescription ?? "cannot copy the metadata")
-        }
-    }
-
-    private func encode(source: URL, destination: URL, info: MediaInfo, quality: Quality,
-                        progress: @escaping @Sendable (Double) -> Void) async throws {
         let process = Process()
         process.executableURL = executable
         process.arguments = Self.arguments(source: source, destination: destination,
@@ -335,6 +363,7 @@ public struct FFmpegTranscoder: Transcoder {
             throw MediaError.encodingFailed(
                 "ffmpeg: " + message.trimmingCharacters(in: .whitespacesAndNewlines))
         }
+        progress(1)
     }
 }
 #endif

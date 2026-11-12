@@ -50,7 +50,7 @@ struct ContentView: View {
             } label: {
                 Label("Choose card", systemImage: "sdcard")
             }
-            .disabled(model.isRunning)
+            .disabled(model.isRunning || model.isScanning)
         }
         ToolbarItemGroup(placement: .topBarTrailing) {
             Button {
@@ -142,8 +142,9 @@ struct VideoList: View {
     }
 }
 
-private func subtitle(_ video: SourceVideo) -> String {
+private func subtitle(_ video: SourceVideo, camera: String?) -> String {
     var parts = [Format.bytes(video.fileSize)]
+    if let camera { parts.insert(camera, at: 0) }
     if let date = video.modified { parts.append(Format.date.string(from: date)) }
     return parts.joined(separator: "  ·  ")
 }
@@ -167,7 +168,7 @@ struct CardRow: View {
                     .opacity(isWaiting ? 0.3 : 1)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(video.filename).foregroundStyle(.primary)
-                    Text(subtitle(video)).font(.caption).foregroundStyle(.secondary)
+                    Text(subtitle(video, camera: model.cameras[video.id])).font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
                 if isWaiting {
@@ -194,7 +195,7 @@ struct WaitingRow: View {
             Image(systemName: "clock").font(.title3).foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 2) {
                 Text(video.filename)
-                Text(subtitle(video)).font(.caption).foregroundStyle(.secondary)
+                Text(subtitle(video, camera: model.cameras[video.id])).font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
             if let entry = model.entries[video.id], entry.outcome == .failed {
@@ -330,6 +331,15 @@ struct SettingsView: View {
                     Text("Photos library")
                 } footer: {
                     Text("Videos in the library that are smaller or newer than this are left alone.")
+                }
+                Section {
+                    Text(model.isSynced
+                         ? "What this app did is shared through iCloud with your other devices "
+                            + "and the Mac app."
+                         : "Not shared with your other devices: this build has no iCloud access.")
+                        .font(.callout).foregroundStyle(.secondary)
+                } header: {
+                    Text("Other devices")
                 }
             }
             .navigationTitle("Settings")

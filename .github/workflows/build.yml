@@ -30,6 +30,10 @@ jobs:
           xcodebuild -project iPad/SDVideoImport.xcodeproj -scheme SDVideoImport \
             -destination 'generic/platform=iOS Simulator' \
             CODE_SIGNING_ALLOWED=NO -quiet build
+      - name: Build the Mac app with its Xcode project (no signing)
+        run: |
+          xcodebuild -project Mac/iCloudVideoResize.xcodeproj -scheme iCloudVideoResize \
+            -destination 'generic/platform=macOS' CODE_SIGNING_ALLOWED=NO -quiet build
       - name: Build the Mac app bundle
         run: ./scripts/build-app.sh
       - name: Pack the app

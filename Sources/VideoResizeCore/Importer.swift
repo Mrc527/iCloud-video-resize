@@ -75,26 +75,32 @@ public struct ImportEntry: Codable, Equatable, Sendable {
     public var newSize: Int64
     public var detail: String
     public var date: Date
+    /// The device that imported the file. nil in logs written before iCloud sync.
+    public var device: String?
 
     public init(outcome: ImportOutcome, filename: String, originalSize: Int64,
-                newSize: Int64, detail: String, date: Date = Date()) {
+                newSize: Int64, detail: String, date: Date = Date(), device: String? = nil) {
         self.outcome = outcome
         self.filename = filename
         self.originalSize = originalSize
         self.newSize = newSize
         self.detail = detail
         self.date = date
+        self.device = device
     }
 }
 
 /// Remembers which files were imported, in a JSON file.
 public final class ImportLog: @unchecked Sendable {
     private let url: URL
+    private let device: String?
     private let lock = NSLock()
     private var stored: [String: ImportEntry] = [:]
 
-    public init(url: URL) {
+    /// `device` is written in the entries set on this device.
+    public init(url: URL, device: String? = nil) {
         self.url = url
+        self.device = device
         guard let data = try? Data(contentsOf: url) else { return }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
@@ -107,8 +113,16 @@ public final class ImportLog: @unchecked Sendable {
     }
 
     public func set(_ entry: ImportEntry, for id: String) {
+        var entry = entry
+        if entry.device == nil { entry.device = device }
+        merge([id: entry])
+    }
+
+    /// Set several entries, with one write of the file.
+    public func merge(_ entries: [String: ImportEntry]) {
+        guard !entries.isEmpty else { return }
         lock.lock(); defer { lock.unlock() }
-        stored[id] = entry
+        stored.merge(entries) { $1 }
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         guard let data = try? encoder.encode(stored) else { return }
@@ -163,11 +177,22 @@ public final class Importer: @unchecked Sendable {
 
         let info = try await Probe.info(video.url)
         let captureDate = info.captureDate ?? video.modified
+        // Android phones and some cameras and drones write the position only as ©xyz or loci.
+        let place = info.latitude.flatMap { latitude in info.longitude.map { (latitude, $0) } }
+            ?? Carryover.userDataLocation(video.url)
 
         // Why the file is added as it is. nil means: re-encode it.
         var keepReason: String?
+        let uncarried: String? = {
+            do { try Carryover.check(video.url) } catch MediaError.unsupported(let what) {
+                return what
+            } catch {}
+            return nil
+        }()
         if info.videoTrackCount != 1 {
             keepReason = "More than one video track"
+        } else if let uncarried {
+            keepReason = "A new file could not carry \(uncarried)"
         } else if Bitrate.expectedSaving(sourceBitrate: info.videoBitrate, width: info.width,
                                          height: info.height, fps: info.fps,
                                          quality: settings.quality) < settings.minSavingPercent {
@@ -175,24 +200,23 @@ public final class Importer: @unchecked Sendable {
         }
 
         if keepReason == nil {
-            let name = video.url.deletingPathExtension().lastPathComponent + ".mov"
-            let destination = work.appendingPathComponent(name)
+            let destination = work.appendingPathComponent(Reencode.outputName(for: video.url))
             do {
                 progress(.encoding, 0)
-                try await NativeTranscoder().transcode(
-                    source: video.url, destination: destination, info: info,
-                    quality: settings.quality) { progress(.encoding, $0) }
+                try await Reencode.run(NativeTranscoder(), source: video.url, destination: destination,
+                                       info: info, quality: settings.quality) { progress(.encoding, $0) }
                 try Task.checkCancellation()
 
                 progress(.verifying, 0)
                 let output = try await Verifier.verify(source: info, output: destination,
+                                                       original: video.url,
                                                        fullDecode: settings.fullVerify)
                 let saving = 100 * (1 - Double(output.fileSize) / Double(max(info.fileSize, 1)))
                 if saving >= settings.minSavingPercent {
                     try Task.checkCancellation()
                     progress(.importing, 0)
                     _ = try await sink.add(file: destination, creationDate: captureDate,
-                                           latitude: info.latitude, longitude: info.longitude)
+                                           latitude: place?.0, longitude: place?.1)
                     return ImportEntry(outcome: .reencoded, filename: video.filename,
                                        originalSize: info.fileSize, newSize: output.fileSize,
                                        detail: String(format: "Saved %.0f%%", saving))
@@ -215,7 +239,7 @@ public final class Importer: @unchecked Sendable {
 
         progress(.importing, 0)
         _ = try await sink.add(file: copy, creationDate: captureDate,
-                               latitude: info.latitude, longitude: info.longitude)
+                               latitude: place?.0, longitude: place?.1)
         return ImportEntry(outcome: .original, filename: video.filename,
                            originalSize: info.fileSize, newSize: info.fileSize,
                            detail: "Added as it is. \(keepReason ?? "")")
@@ -231,6 +255,8 @@ public final class Inbox: @unchecked Sendable {
         var fileSize: Int64
         var modified: Date?
         var folder: String
+        /// When the copy was made. nil for copies made by an older version.
+        var copied: Date?
     }
 
     private let directory: URL
@@ -275,11 +301,22 @@ public final class Inbox: @unchecked Sendable {
         return items[id] != nil
     }
 
+    /// Another device put this card file in Photos after it was copied here: the copy is
+    /// not needed. A file chosen again on purpose was copied after that import, so it is
+    /// still imported.
+    public func importedElsewhere(_ id: String, log: ImportLog, device: String) -> Bool {
+        let copied: Date? = { lock.lock(); defer { lock.unlock() }; return items[id]?.copied }()
+        guard let entry = log.entries[id], entry.outcome != .failed,
+              let other = entry.device, other != device, let copied
+        else { return false }
+        return entry.date > copied
+    }
+
     /// Copy a video from the card. The file on the card is not changed.
     public func add(_ video: SourceVideo) throws {
         if contains(video.id) { return }
         let item = Item(filename: video.filename, fileSize: video.fileSize,
-                        modified: video.modified, folder: UUID().uuidString)
+                        modified: video.modified, folder: UUID().uuidString, copied: Date())
         let folder = directory.appendingPathComponent(item.folder)
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)

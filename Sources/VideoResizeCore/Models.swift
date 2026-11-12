@@ -85,9 +85,12 @@ public struct VideoItem: Identifiable, Equatable, Sendable {
     public var fileSize: Int64
     /// Set for kinds of video we never touch.
     public var skipReason: String?
+    /// The camera or phone that shot the video, as Photos shows it. nil when unknown.
+    public var device: String?
 
     public init(id: String, filename: String, creationDate: Date?, duration: Double,
-                width: Int, height: Int, fileSize: Int64, skipReason: String? = nil) {
+                width: Int, height: Int, fileSize: Int64, skipReason: String? = nil,
+                device: String? = nil) {
         self.id = id
         self.filename = filename
         self.creationDate = creationDate
@@ -96,6 +99,7 @@ public struct VideoItem: Identifiable, Equatable, Sendable {
         self.height = height
         self.fileSize = fileSize
         self.skipReason = skipReason
+        self.device = device
     }
 
     /// Whole-file bit rate in bits per second. Close enough to the video bit rate.
@@ -112,6 +116,12 @@ public enum Status: String, Codable, Sendable {
     case skipped      // a kind of video we do not touch
     case failed       // error, tried again later
     case needsReview  // stopped during import; a person must check for a duplicate
+    case restored     // on request the new video was deleted and the original kept; may run again
+}
+
+extension Status {
+    /// A smaller copy of the video was added to Photos.
+    public var hasNewVideo: Bool { self == .replaced || self == .deleted }
 }
 
 public struct Record: Codable, Equatable, Sendable {

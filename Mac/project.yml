@@ -1,0 +1,29 @@
+# The Mac app as an Xcode project, so that it can be signed with a team and use iCloud.
+# Regenerate after editing: cd Mac && xcodegen generate
+name: iCloudVideoResize
+options:
+  deploymentTarget: {macOS: "14.0"}
+packages:
+  Core:
+    path: ..
+targets:
+  iCloudVideoResize:
+    type: application
+    platform: macOS
+    sources:
+      - path: ../Sources/VideoResizeApp
+      - path: ../Resources/AppIcon.icns
+        buildPhase: resources
+    dependencies:
+      - package: Core
+        product: VideoResizeCore
+    settings:
+      base:
+        PRODUCT_NAME: VideoResizeApp
+        PRODUCT_BUNDLE_IDENTIFIER: ch.visin.icloudvideoresize
+        INFOPLIST_FILE: ../Resources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: iCloudVideoResize.entitlements
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ""
+        ENABLE_HARDENED_RUNTIME: NO
+        SWIFT_VERSION: "5.0"

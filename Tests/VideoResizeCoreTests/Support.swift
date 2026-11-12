@@ -6,11 +6,69 @@ import XCTest
 enum Sample {
     static let captureDate = "2020-01-01T10:00:00+0100"
 
+    /// A video as some drones and cameras write it: the position as a ©xyz user data tag,
+    /// camera make and model, a timed GPS track, and a camera box at the end of the file.
+    static func makeDroneVideo(at url: URL, movieTimeScale: CMTimeScale? = nil,
+                               positionTrackFirst: Bool = false) async throws {
+        try await makeVideo(at: url, userData: [
+            .quickTimeUserDataLocationISO6709: "+46.0037+008.9511+273.000/",
+            .quickTimeUserDataMake: "DJI",
+            .quickTimeUserDataModel: "Mini 4 Pro",
+        ], positionTrack: true, positionTrackFirst: positionTrackFirst,
+           movieTimeScale: movieTimeScale)
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        // Shot long ago: 2020-01-01, in seconds since 1904, in the movie header.
+        let file = try MovieFile(url: url)
+        let moov = try XCTUnwrap(file.topLevel.first { $0.type == "moov" })
+        let mvhd = try XCTUnwrap(file.moov?.bytes.range(of: Data("mvhd".utf8)))
+        var date = Data()
+        date.append(uint32: 3_660_681_600)
+        date.append(uint32: 3_660_681_600)
+        try handle.seek(toOffset: moov.offset + UInt64(mvhd.upperBound) + 4)  // after version, flags
+        try handle.write(contentsOf: date)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Boxes.make("uuid", Data(repeating: 0xAB, count: 16)
+            + Data("<camera>settings</camera>".utf8)))
+    }
+
+    /// The positions of the timed GPS track, in order.
+    static func timedPositions(in url: URL) async throws -> [String] {
+        let asset = AVURLAsset(url: url)
+        guard let track = try await asset.loadTracks(withMediaType: .metadata).first else { return [] }
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        reader.add(output)
+        let adaptor = AVAssetReaderOutputMetadataAdaptor(assetReaderTrackOutput: output)
+        reader.startReading()
+        var positions: [String] = []
+        while let group = adaptor.nextTimedMetadataGroup() {
+            for item in group.items { positions.append(try await item.load(.stringValue) ?? "?") }
+        }
+        return positions
+    }
+
+    /// Rewrite the movie index of a file made by AVAssetWriter. Its media data comes
+    /// before the index, so no data moves.
+    static func editMoov(_ url: URL, _ change: ([RawBox]) -> [Data]) throws {
+        let file = try MovieFile(url: url)
+        let top = try XCTUnwrap(file.topLevel.first { $0.type == "moov" })
+        let moov = try XCTUnwrap(file.moov)
+        let data = try Data(contentsOf: url)
+        let edited = data.prefix(Int(top.offset)) + Boxes.container("moov", change(moov.children))
+            + data.suffix(from: Int(top.offset + top.size))
+        try edited.write(to: url)
+    }
+
     /// A short H.264 clip of moving noise, encoded wastefully like a camera would.
     static func makeVideo(at url: URL, seconds: Int = 2, width: Int = 640,
-                          height: Int = 360, location: String? = nil) async throws {
+                          height: Int = 360, location: String? = nil,
+                          userData: [AVMetadataIdentifier: String] = [:],
+                          positionTrack: Bool = false, positionTrackFirst: Bool = false,
+                          movieTimeScale: CMTimeScale? = nil, language: String? = nil) async throws {
         try? FileManager.default.removeItem(at: url)
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        if let movieTimeScale { writer.movieTimeScale = movieTimeScale }
 
         func text(_ identifier: AVMetadataIdentifier, _ value: String) -> AVMetadataItem {
             let item = AVMutableMetadataItem()
@@ -21,6 +79,7 @@ enum Sample {
         }
         writer.metadata = [text(.quickTimeMetadataCreationDate, captureDate)]
             + (location.map { [text(.quickTimeMetadataLocationISO6709, $0)] } ?? [])
+            + userData.map { text($0.key, $0.value) }
 
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.h264,
@@ -35,11 +94,47 @@ enum Sample {
                 kCVPixelBufferWidthKey as String: width,
                 kCVPixelBufferHeightKey as String: height,
             ])
-        writer.add(input)
+        input.languageCode = language
+        if !(positionTrack && positionTrackFirst) { writer.add(input) }
+        var positions: AVAssetWriterInputMetadataAdaptor?
+        if positionTrack {
+            let specification: NSDictionary = [
+                kCMMetadataFormatDescriptionMetadataSpecificationKey_Identifier:
+                    AVMetadataIdentifier.quickTimeMetadataLocationISO6709.rawValue,
+                kCMMetadataFormatDescriptionMetadataSpecificationKey_DataType:
+                    kCMMetadataDataType_QuickTimeMetadataLocation_ISO6709,
+            ]
+            var description: CMFormatDescription?
+            CMMetadataFormatDescriptionCreateWithMetadataSpecifications(
+                allocator: nil, metadataType: kCMMetadataFormatType_Boxed,
+                metadataSpecifications: [specification] as CFArray, formatDescriptionOut: &description)
+            let track = AVAssetWriterInput(mediaType: .metadata, outputSettings: nil,
+                                           sourceFormatHint: description)
+            track.expectsMediaDataInRealTime = false
+            writer.add(track)
+            if positionTrackFirst { writer.add(input) }  // the GPS track gets the first number
+            track.addTrackAssociation(withTrackOf: input,
+                                      type: AVAssetTrack.AssociationType.metadataReferent.rawValue)
+            positions = AVAssetWriterInputMetadataAdaptor(assetWriterInput: track)
+        }
         guard writer.startWriting() else { throw writer.error ?? CocoaError(.fileWriteUnknown) }
         writer.startSession(atSourceTime: .zero)
 
         for frame in 0..<(seconds * 30) {
+            if let positions, frame % 30 == 0 {
+                let item = AVMutableMetadataItem()
+                item.identifier = .quickTimeMetadataLocationISO6709
+                item.dataType = kCMMetadataDataType_QuickTimeMetadataLocation_ISO6709 as String
+                item.value = "+46.00\(frame / 30)7+008.9511+273.000/" as NSString
+                let range = CMTimeRange(start: CMTime(value: CMTimeValue(frame), timescale: 30),
+                                        duration: CMTime(value: 30, timescale: 30))
+                while !positions.assetWriterInput.isReadyForMoreMediaData {
+                    try await Task.sleep(nanoseconds: 2_000_000)
+                }
+                guard positions.append(AVTimedMetadataGroup(items: [item], timeRange: range)) else {
+                    throw writer.error ?? CocoaError(.fileWriteUnknown)
+                }
+            }
             while !input.isReadyForMoreMediaData {
                 try await Task.sleep(nanoseconds: 2_000_000)
             }
@@ -60,6 +155,7 @@ enum Sample {
             }
         }
         input.markAsFinished()
+        positions?.assetWriterInput.markAsFinished()
         await writer.finishWriting()
         guard writer.status == .completed else {
             throw writer.error ?? CocoaError(.fileWriteUnknown)
@@ -140,6 +236,10 @@ final class FakeLibrary: VideoLibrary, @unchecked Sendable {
     func exists(_ id: String) -> Bool { present.contains(id) }
 
     func park(original id: String, albumTitle: String) async throws { parked.append(id) }
+
+    func unpark(original id: String, albumTitle: String) async throws {
+        parked.removeAll { $0 == id }
+    }
 
     func delete(_ ids: [String]) async throws { present.subtract(ids) }
 }

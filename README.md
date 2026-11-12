@@ -3,12 +3,51 @@
 Two apps that make your videos smaller with HEVC (H.265), at the same
 resolution, so they take less iCloud space and less time to upload.
 
-| App | Where | What it does |
-|---|---|---|
-| **SD Video Import** | iPad, iPhone | Imports videos from an SD card and makes them smaller **before** they go into Photos. iCloud uploads only the small version. It can also make smaller the videos already in the library, like the Mac app. |
-| **iCloud Video Resize** | Mac | Makes smaller the videos that are **already** in your iCloud Photos library. |
+| App | Where |
+|---|---|
+| **SD Video Import** | iPad, iPhone |
+| **iCloud Video Resize** | Mac |
 
-Both use the same code to encode and to check the result.
+Both apps do the same two things, with the same code to encode and to check
+the result:
+
+- **SD card**: import videos from an SD card or a folder and make them
+  smaller **before** they go into Photos. iCloud uploads only the small
+  version.
+- **Photos library**: make smaller the videos that are **already** in your
+  iCloud Photos library.
+
+## What is kept
+
+A new video loses nothing of the original but size:
+
+- Same resolution, frame rate, rotation, HDR and 10-bit.
+- Same file name and type: `C0001.MP4` stays `C0001.MP4`, `IMG_1234.MOV`
+  stays `IMG_1234.MOV`.
+- All the data of the original file, byte for byte: Apple's tags (date,
+  place, camera), the user data tags (such as GPS written as `©xyz` or
+  `loci`, camera make and model, GoPro and DJI tags), the extra tracks with
+  all their samples (GoPro GPMF GPS and sensors, drone flight data, timed
+  metadata, timecode, subtitles), the other boxes of the file (such as camera
+  XML), the language and name of each track, and the creation dates.
+- A file whose data is found through fixed places in the file (some
+  dashcams write their GPS that way) cannot be carried into a new file: it
+  is kept as it is.
+- Audio is copied as it is. Only uncompressed audio (LPCM, recorded by many
+  cameras) becomes AAC at 128 kbit/s per channel: it would otherwise be about
+  a tenth of the new file.
+
+Before a new video goes into Photos, the check compares it with the original:
+every box, tag and track of the original must be in the new file and the
+data of every extra track must be identical; with the default setting every
+frame must also decode. If anything is missing, nothing is added and the
+original stays as it is.
+
+Not verified yet: real GoPro and DJI files. The tests use files made with
+Apple's and ffmpeg's tools that have the same kinds of data.
+
+When the position is only in `©xyz` or `loci` (Android phones, some cameras
+and drones), the app also gives it to Photos, which does not read it there.
 
 # SD Video Import (iPad)
 
@@ -21,11 +60,10 @@ Both use the same code to encode and to check the result.
    - **Copy.** The videos are copied from the card to the iPad. This is as
      fast as the card can be read. When it is done the app says
      "You can remove the card now".
-   - **Re-encode.** For each copy the app encodes it to HEVC (same
-     resolution and frame rate, audio copied without changes, 10-bit video
-     kept 10-bit), checks the new file (codec, resolution, duration, audio
-     tracks, a decode of every frame), and adds it to Photos with the
-     capture date and place of the original. Then the copy is deleted.
+   - **Re-encode.** For each copy the app encodes it to HEVC, keeping
+     everything listed in [What is kept](#what-is-kept), checks the new file,
+     and adds it to Photos with the capture date and place of the original.
+     Then the copy is deleted.
 4. A video that would not get at least 20% smaller is added as it is.
 
 The copies wait safely on the iPad. You can close the app and continue
@@ -64,6 +102,10 @@ version, and parks the original in the album
 press **Delete originals**. The steps, the videos left alone and the limits
 are the same as in the Mac section below.
 
+Tap the circle of a video to select it: **Start** then re-encodes only the
+selected videos. Tap the rest of the line to play the video. Touch and hold a
+line for **Restore original**, see the Mac section.
+
 Two differences from the Mac:
 
 - Only the Apple encoder is used. ffmpeg cannot run on an iPad.
@@ -89,7 +131,7 @@ can install it with the TestFlight app. Everything can be done in a browser.
 One-time setup:
 
 1. On developer.apple.com, under Identifiers, register the App ID
-   `ch.visin.sdvideoimport`.
+   `ch.visin.sdvideoimport` with the **iCloud** capability.
 2. On appstoreconnect.apple.com, under Apps, create a new iOS app with that
    bundle ID.
 3. Under Users and Access, Integrations, create an App Store Connect API key
@@ -109,13 +151,20 @@ from the TestFlight app.
 ## How it works
 
 The app shows all the videos of your Photos library and marks the ones worth
-re-encoding. When you press **Start**, for each video, biggest first:
+re-encoding. The **Device** column shows the camera or phone that shot each
+video: what Photos knows (Photos reads only the tags iPhones write), else
+what the file itself says when its original is on this Mac (for example
+"GoPro HERO11 Black"), else a guess from the file name, such as "GoPro (from
+the name)". Originals that are only in iCloud are not downloaded for this.
+Double-click a video to play it. Select videos (Cmd-click, Shift-click) to
+re-encode only those; with nothing selected, **Start** takes the whole To do
+list. When you press **Start**, for each video, biggest first:
 
 1. **Download.** If the original is only in iCloud, Photos downloads it.
-2. **Encode** to HEVC. Same resolution, same frame rate, audio copied without
-   changes, 10-bit HDR kept, capture date and GPS kept.
-3. **Check** the new file: codec, resolution, duration, audio tracks, date,
-   GPS, and a full decode of every frame.
+2. **Encode** to HEVC, keeping everything listed in
+   [What is kept](#what-is-kept).
+3. **Check** the new file: codec, resolution, duration, audio tracks, every
+   box, tag and track of the original, and a full decode of every frame.
 4. **Check the saving.** If the new file is not at least 20% smaller, the
    original stays and nothing changes.
 5. **Add** the new video to Photos, with the same date, place, favorite flag
@@ -130,6 +179,14 @@ confirm once for the whole batch. The originals stay recoverable for 30 days.
 Note: iCloud space goes **up** a little until you delete the originals, and
 it is fully free only when Recently Deleted is emptied.
 
+To undo a replacement, right-click the original or its new video and choose
+**Restore original**. The new video moves to Recently Deleted, the original
+leaves the album and comes back to the To do list.
+
+The **SD card** tab imports from a card or a folder exactly as the iPad app
+does, see [SD Video Import](#sd-video-import-ipad). The copies wait in
+`~/Library/Application Support/iCloudVideoResize/inbox`.
+
 ## What it leaves alone
 
 - Videos edited in Photos (the edits would be lost)
@@ -138,6 +195,8 @@ it is fully free only when Recently Deleted is emptied.
 - Hidden videos and shared albums
 - Videos smaller than 20 MB or newer than 7 days
 - Videos that are already well compressed
+- Videos in the album `Video Resize: originals to delete`, also when another
+  device (Mac, iPad or iPhone) put them there
 
 ## Limits you should know
 
@@ -154,7 +213,7 @@ You need macOS 14 or newer and Xcode (or the Xcode command line tools).
 ```bash
 git clone https://github.com/mrc527/icloud-video-resize.git
 cd icloud-video-resize
-./scripts/build-app.sh
+DEVELOPMENT_TEAM=<your team ID> ./scripts/build-app.sh
 open "build/iCloud Video Resize.app"
 ```
 
@@ -163,8 +222,21 @@ At the first start macOS asks for access to Photos. Choose full access.
 Always start the app from the bundle built by the script. `swift run` does
 not work: macOS gives access to Photos only to a real app bundle.
 
-The app is signed for your Mac only. After each new build macOS may ask for
-access to Photos again.
+With `DEVELOPMENT_TEAM` the app is signed with your Apple developer team (you
+need Xcode signed in to that account) and shares its records with the
+iPad/iPhone app, see [Several devices](#several-devices). Without it the app
+is signed for your Mac only and shares nothing. After each new build macOS
+may ask for access to Photos again.
+
+## Several devices
+
+The Mac, iPad and iPhone see the same iCloud Photos library, so they share
+what they did through iCloud: a video replaced, judged not worth it or failed
+on one device is not processed again on another. A card imported on the iPad
+is not selected again on the iPhone. It works when both apps are signed with
+the same team and the devices use the same Apple Account. Changes reach the
+other devices when iCloud syncs them, which is not instant. The **Settings**
+of each app say whether sharing is on.
 
 ## First use
 
@@ -214,9 +286,12 @@ swift test
 - `Sources/VideoResizeCore`: Photos access, encoding, checks, state. Used by
   both apps.
 - `Sources/VideoResizeApp`: the Mac interface.
+- `Mac/`: the Xcode project of the Mac app, used for the signed build.
+  Generated from `Mac/project.yml` with `xcodegen generate`.
 - `iPad/`: the Xcode project and the interface of the iPad app.
 - `Tests`: the tests really encode short videos with the Apple encoder, and
   use a fake photo library.
 
 A GitHub Action builds and tests every push on a macOS runner. It also
-builds the iPad app for the simulator, and uploads the Mac app as an artifact.
+builds the iPad app for the simulator and the Mac Xcode project without
+signing, and uploads the unsigned Mac app as an artifact.

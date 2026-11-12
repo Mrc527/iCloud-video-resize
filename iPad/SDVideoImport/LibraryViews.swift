@@ -1,3 +1,4 @@
+import AVKit
 import SwiftUI
 import UIKit
 import VideoResizeCore
@@ -10,6 +11,8 @@ struct LibraryScreen: View {
     @State private var filter: LibraryFilter = .todo
     @State private var showingSettings = false
     @State private var confirmDelete = false
+    @State private var playing: VideoItem?
+    @State private var restoring: Set<String> = []
 
     var body: some View {
         NavigationStack {
@@ -26,18 +29,29 @@ struct LibraryScreen: View {
             .navigationTitle("Photos library")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { toolbar }
-            .safeAreaInset(edge: .bottom) {
-                if model.access == .granted {
-                    LibraryBottomBar(progress: model.progress) { confirmDelete = true }
-                }
-            }
         }
         .task { await model.load() }
+        .onChange(of: filter) { model.selection = [] }
         .sheet(isPresented: $showingSettings) { SettingsView() }
+        .fullScreenCover(item: $playing) { LibraryPlayer(item: $0) }
         .alert("Photos library", isPresented: messageShown) {
             Button("OK") {}
         } message: {
             Text(model.message ?? "")
+        }
+        .confirmationDialog(
+            "Restore the original of \(restoring.count) video(s)?",
+            isPresented: Binding(get: { !restoring.isEmpty }, set: { if !$0 { restoring = [] } }),
+            titleVisibility: .visible
+        ) {
+            Button("Restore originals", role: .destructive) {
+                let ids = restoring
+                Task { await model.restore(ids) }
+            }
+        } message: {
+            Text("The new smaller videos move to Recently Deleted. The originals leave the album "
+                + "\"\(Pipeline.albumTitle)\" and come back to the To do list. "
+                + "You will be asked to confirm the deletion once more.")
         }
         .confirmationDialog(
             "Delete \(model.waitingForDeletion) original video(s)?",
@@ -59,6 +73,10 @@ struct LibraryScreen: View {
         let rows = model.rows(filter, settings: importModel.settings)
         return List {
             Section {
+                LibrarySummary(progress: model.progress)
+                    .listRowBackground(Color.clear)
+            }
+            Section {
                 Picker("Show", selection: $filter) {
                     ForEach(LibraryFilter.allCases) { Text($0.rawValue).tag($0) }
                 }
@@ -75,11 +93,45 @@ struct LibraryScreen: View {
                     Text("No videos in this list.").foregroundStyle(.secondary)
                 }
                 ForEach(rows) { row in
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(row.name)
-                        Text(row.detail).font(.caption).foregroundStyle(.secondary)
-                        Text(row.status).font(.caption)
-                            .foregroundStyle(row.isTodo ? Color.accentColor : Color.secondary)
+                    let isSelected = model.selection.contains(row.id)
+                    HStack(spacing: 12) {
+                        // The circle selects; the rest of the row plays the video.
+                        Button {
+                            model.toggle(row.id)
+                        } label: {
+                            Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                                .font(.title3)
+                                .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(model.isRunning)
+                        Button {
+                            playing = model.items.first { $0.id == row.id }
+                        } label: {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(row.name)
+                                Text(row.detail).font(.caption).foregroundStyle(.secondary)
+                                Text(row.status).font(.caption)
+                                    .foregroundStyle(row.isTodo ? Color.accentColor : Color.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .contextMenu {
+                        Button {
+                            playing = model.items.first { $0.id == row.id }
+                        } label: {
+                            Label("Play", systemImage: "play")
+                        }
+                        // On a selected line: all the selected videos, as on the Mac.
+                        Button(role: .destructive) {
+                            restoring = isSelected ? model.selection : [row.id]
+                        } label: {
+                            Label("Restore original…", systemImage: "arrow.uturn.backward")
+                        }
+                        .disabled(model.isRunning || model.isScanning)
                     }
                 }
             } header: {
@@ -94,13 +146,38 @@ struct LibraryScreen: View {
 
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
-        ToolbarItemGroup(placement: .topBarTrailing) {
+        ToolbarItem(placement: .topBarLeading) {
             Button {
                 Task { await model.scan() }
             } label: {
                 Label("Read again", systemImage: "arrow.clockwise")
             }
             .disabled(model.access != .granted || model.isScanning || model.isRunning)
+        }
+        ToolbarItemGroup(placement: .topBarTrailing) {
+            if model.isRunning {
+                Button {
+                    model.stop()
+                } label: {
+                    Label(model.isStopping ? "Stopping" : "Stop", systemImage: "stop.fill")
+                }
+                .disabled(model.isStopping)
+            } else {
+                Button {
+                    model.start(importModel.settings)
+                } label: {
+                    Label("Start", systemImage: "play.fill")
+                }
+                .disabled(model.access != .granted || model.isScanning
+                          || model.chosen(importModel.settings).isEmpty)
+            }
+
+            Button {
+                confirmDelete = true
+            } label: {
+                Label("Delete originals", systemImage: "trash")
+            }
+            .disabled(model.waitingForDeletion == 0 || model.isRunning)
 
             Button {
                 showingSettings = true
@@ -112,15 +189,26 @@ struct LibraryScreen: View {
     }
 }
 
-struct LibraryBottomBar: View {
+/// Counts and progress, at the top of the list as in the Mac app.
+struct LibrarySummary: View {
     @EnvironmentObject private var model: LibraryModel
     @EnvironmentObject private var importModel: ImportModel
     @ObservedObject var progress: ProgressModel
-    let askDelete: () -> Void
 
     var body: some View {
         let queue = model.queue(importModel.settings)
-        VStack(spacing: 10) {
+        let chosen = model.chosen(importModel.settings)
+        VStack(alignment: .leading, spacing: 12) {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), alignment: .leading)],
+                      alignment: .leading, spacing: 10) {
+                stat("To do", "\(queue.count)  (\(Format.bytes(size(queue))))")
+                if !model.selection.isEmpty {
+                    stat("Selected", "\(model.selection.count), \(chosen.count) to do  "
+                        + "(\(Format.bytes(size(chosen))))")
+                }
+                stat("Space saved", Format.bytes(model.savedBytes))
+                stat("Originals to delete", "\(model.waitingForDeletion)")
+            }
             if let filename = progress.filename {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("\(progress.phase.rawValue) \(progress.position): \(filename)")
@@ -135,36 +223,75 @@ struct LibraryBottomBar: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
-            HStack {
-                if model.savedBytes > 0 {
-                    Text("Saved: \(Format.bytes(model.savedBytes))")
-                        .font(.callout).foregroundStyle(.secondary)
-                }
-                Spacer()
-                if model.waitingForDeletion > 0 {
-                    Button("Delete \(model.waitingForDeletion) original(s)", role: .destructive,
-                           action: askDelete)
-                        .buttonStyle(.bordered)
-                        .disabled(model.isRunning)
-                }
-                if model.isRunning {
-                    Button(model.isStopping ? "Stopping…" : "Stop", role: .destructive) {
-                        model.stop()
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(model.isStopping)
+        }
+    }
+
+    private func size(_ videos: [VideoItem]) -> Int64 {
+        videos.reduce(0) { $0 + $1.fileSize }
+    }
+
+    private func stat(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title).font(.caption).foregroundStyle(.secondary)
+            Text(value).font(.headline).monospacedDigit()
+        }
+    }
+}
+
+/// AVKit's player. SwiftUI's VideoPlayer crashed on the Mac: it needs AVKit loaded, and
+/// nothing else made the app link AVKit.
+struct PlayerView: UIViewControllerRepresentable {
+    let player: AVPlayer
+
+    func makeUIViewController(context: Context) -> AVPlayerViewController {
+        let controller = AVPlayerViewController()
+        controller.player = player
+        return controller
+    }
+
+    func updateUIViewController(_ controller: AVPlayerViewController, context: Context) {
+        controller.player = player
+    }
+}
+
+/// Plays a video of the library. Photos streams it from iCloud when needed.
+struct LibraryPlayer: View {
+    @EnvironmentObject private var model: LibraryModel
+    @Environment(\.dismiss) private var dismiss
+    let item: VideoItem
+    @State private var player: AVPlayer?
+    @State private var failure: String?
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                Color.black.ignoresSafeArea()
+                if let player {
+                    PlayerView(player: player).ignoresSafeArea()
+                } else if let failure {
+                    Text(failure).foregroundStyle(.white).padding()
                 } else {
-                    Button("Start: \(queue.count) video(s), "
-                        + Format.bytes(queue.reduce(0) { $0 + $1.fileSize })) {
-                        model.start(importModel.settings)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(queue.isEmpty || model.isScanning)
+                    ProgressView().tint(.white)
+                }
+            }
+            .navigationTitle(item.filename)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
                 }
             }
         }
-        .padding()
-        .background(.bar)
+        .task {
+            do {
+                let player = AVPlayer(playerItem: try await model.playerItem(for: item))
+                self.player = player
+                player.play()
+            } catch {
+                failure = "Cannot play this video: \(error.localizedDescription)"
+            }
+        }
+        .onDisappear { player?.pause() }
     }
 }
 

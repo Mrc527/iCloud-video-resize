@@ -144,6 +144,22 @@ final class FFmpegArgumentsTests: XCTestCase {
         args.firstIndex(of: flag).map { args[$0 + 1] }
     }
 
+    func testUncompressedAudioBecomesAACAndTheTypeStays() {
+        var info = info(tenBit: false)
+        info.aacBitrates = [0, 256_000]
+        let args = FFmpegTranscoder.arguments(
+            source: URL(fileURLWithPath: "/C0001.MP4"), destination: URL(fileURLWithPath: "/C0001.MP4"),
+            info: info, quality: .balanced)
+        XCTAssertEqual(value(after: "-c:a", in: args), "copy")
+        XCTAssertNil(value(after: "-c:a:0", in: args))
+        XCTAssertEqual(value(after: "-c:a:1", in: args), "aac")
+        XCTAssertEqual(value(after: "-b:a:1", in: args), "256000")
+        XCTAssertEqual(value(after: "-f", in: args), "mp4")
+        XCTAssertEqual(Reencode.outputName(for: URL(fileURLWithPath: "/C0001.MP4")), "C0001.MP4")
+        XCTAssertEqual(Reencode.outputName(for: URL(fileURLWithPath: "/IMG_1.MOV")), "IMG_1.MOV")
+        XCTAssertEqual(Reencode.outputName(for: URL(fileURLWithPath: "/clip.avi")), "clip.mov")
+    }
+
     func testHDRVideoKeeps10BitAndColour() {
         let args = FFmpegTranscoder.arguments(
             source: URL(fileURLWithPath: "/in.mov"), destination: URL(fileURLWithPath: "/out.mov"),
@@ -162,7 +178,8 @@ final class FFmpegArgumentsTests: XCTestCase {
             info: info(tenBit: false), quality: .compact)
         XCTAssertEqual(value(after: "-pix_fmt", in: args), "yuv420p")
         XCTAssertEqual(value(after: "-c:a", in: args), "copy")
-        XCTAssertEqual(value(after: "-map_metadata", in: args), "0")
+        XCTAssertEqual(value(after: "-map_metadata", in: args), "-1", "Carryover puts it back")
+        XCTAssertEqual(value(after: "-f", in: args), "mov")
         XCTAssertEqual(value(after: "-tag:v", in: args), "hvc1")
         XCTAssertEqual(value(after: "-crf", in: args), "27")
     }

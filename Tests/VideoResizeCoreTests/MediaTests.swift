@@ -49,9 +49,10 @@ final class TranscodeTests: TempDirectoryTestCase {
         XCTAssertTrue(info.hasLocation)
 
         let destination = temp.appendingPathComponent("out.mov")
-        try await FFmpegTranscoder(executable: ffmpeg).transcode(
-            source: source, destination: destination, info: info, quality: .balanced) { _ in }
-        let output = try await Verifier.verify(source: info, output: destination, fullDecode: true)
+        try await Reencode.run(FFmpegTranscoder(executable: ffmpeg), source: source,
+                               destination: destination, info: info, quality: .balanced) { _ in }
+        let output = try await Verifier.verify(source: info, output: destination, original: source,
+                                               fullDecode: true)
 
         XCTAssertTrue(output.isHEVC)
         XCTAssertEqual(output.latitude ?? 0, 46.0037, accuracy: 0.0001)
@@ -133,6 +134,129 @@ final class PipelineTests: TempDirectoryTestCase {
         XCTAssertFalse(library.exists("A"))
         XCTAssertTrue(library.exists("NEW-A"))
         XCTAssertEqual(store.record(for: "A")?.status, .deleted)
+    }
+
+    func testADroneVideoIsReplacedWithAllItsData() async throws {
+        try await prepare()
+        let source = temp.appendingPathComponent("library-DJI_0001.MOV")
+        try await Sample.makeDroneVideo(at: source)
+        library.add("D", file: source)
+        let size = Int64(try source.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0)
+        let drone = VideoItem(id: "D", filename: "DJI_0001.MOV", creationDate: nil, duration: 2,
+                              width: 640, height: 360, fileSize: size)
+
+        let record = await pipeline.process(drone, settings: AppSettings()) { _, _ in }
+
+        XCTAssertEqual(record?.status, .replaced, record?.detail ?? "")
+        XCTAssertEqual(library.imported["NEW-D"], "DJI_0001.MOV")
+    }
+
+    func testAVideoReplacedOnAnotherDeviceMeanwhileIsNotAddedAgain() async throws {
+        try await prepare()
+        // Arrived through iCloud while this device was encoding.
+        store.set(Record(status: .replaced, filename: "IMG_0002.MOV", newIdentifier: "OTHER"),
+                  for: "A")
+        let record = await pipeline.process(item, settings: AppSettings()) { _, _ in }
+
+        XCTAssertEqual(record?.status, .replaced)
+        XCTAssertEqual(store.record(for: "A")?.newIdentifier, "OTHER")
+        XCTAssertTrue(library.imported.isEmpty, "no second copy in Photos")
+        XCTAssertTrue(library.parked.isEmpty)
+    }
+
+    func testASmallSavingDoesNotHideACopyMadeOnAnotherDevice() async throws {
+        try await prepare()
+        let other = Record(status: .replaced, filename: "IMG_0002.MOV", newIdentifier: "OTHER")
+        store.set(other, for: "A")
+        var settings = AppSettings()
+        settings.minSavingPercent = 99.9  // this device ends with "not worth it"
+
+        let record = await pipeline.process(item, settings: settings) { _, _ in }
+
+        XCTAssertEqual(record, other)
+        XCTAssertEqual(store.record(for: "A"), other)
+    }
+
+    func testAFailureDoesNotHideACopyMadeOnAnotherDevice() async throws {
+        try await prepare()
+        let broken = temp.appendingPathComponent("broken.mov")
+        try Data(repeating: 7, count: 50_000).write(to: broken)
+        library.add("A", file: broken)
+        let other = Record(status: .replaced, filename: "IMG_0002.MOV", newIdentifier: "OTHER")
+        store.set(other, for: "A")
+
+        let record = await pipeline.process(item, settings: AppSettings()) { _, _ in }
+
+        XCTAssertEqual(record, other)
+        XCTAssertEqual(store.record(for: "A"), other, "no failure, no extra attempt")
+    }
+
+    func testARestoreDeletesTheNewVideoAndBringsTheOriginalBack() async throws {
+        try await prepare()
+        await pipeline.process(item, settings: AppSettings()) { _, _ in }
+        XCTAssertEqual(library.parked, ["A"])
+
+        // Chosen from the line of the new video.
+        let result = try await pipeline.restore(["NEW-A"])
+
+        XCTAssertEqual(result.restored, 1)
+        XCTAssertEqual(result.notHere, 0)
+        XCTAssertFalse(library.exists("NEW-A"), "the new video is deleted")
+        XCTAssertTrue(library.exists("A"), "the original stays")
+        XCTAssertTrue(library.parked.isEmpty, "the original leaves the album")
+        let record = try XCTUnwrap(store.record(for: "A"))
+        XCTAssertEqual(record.status, .restored)
+        XCTAssertNil(record.newIdentifier)
+        var settings = AppSettings()
+        settings.minSizeMB = 0
+        settings.minAgeDays = 0
+        settings.minSavingPercent = 0
+        XCTAssertEqual(Policy.decide(item: item, record: record, settings: settings, outputs: []),
+                       .process, "it can be re-encoded later")
+    }
+
+    func testNoRestoreBeforeTheNewVideoIsOnThisDevice() async throws {
+        try await prepare()
+        // Replaced on another device; the new video has not reached this one yet.
+        let record = Record(status: .replaced, filename: "IMG_0002.MOV", newIdentifier: nil)
+        store.set(record, for: "A")
+        try await library.park(original: "A", albumTitle: Pipeline.albumTitle)
+
+        let result = try await pipeline.restore(["A"])
+
+        XCTAssertEqual(result.restored, 0)
+        XCTAssertEqual(result.notHere, 1)
+        XCTAssertEqual(store.record(for: "A"), record, "still replaced")
+        XCTAssertEqual(library.parked, ["A"], "still waiting in the album")
+    }
+
+    func testARestoreAfterThePersonDeletedTheNewVideo() async throws {
+        try await prepare()
+        await pipeline.process(item, settings: AppSettings()) { _, _ in }
+        try await library.delete(["NEW-A"])  // deleted by hand in Photos
+
+        let result = try await pipeline.restore(["A"])
+
+        XCTAssertEqual(result.restored, 1)
+        XCTAssertTrue(library.parked.isEmpty, "the original leaves the album")
+        XCTAssertEqual(store.record(for: "A")?.status, .restored)
+    }
+
+    func testAVideoWithDataAtFixedPlacesIsLeftAsItIs() async throws {
+        try await prepare()
+        let source = temp.appendingPathComponent("library-NVT_0001.MOV")
+        try await Sample.makeVideo(at: source)
+        try Sample.editMoov(source) { $0.map(\.bytes) + [Boxes.make("gps ", Data(count: 16))] }
+        library.add("G", file: source)
+        let size = Int64(try source.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0)
+        let dashcam = VideoItem(id: "G", filename: "NVT_0001.MOV", creationDate: nil, duration: 2,
+                                width: 640, height: 360, fileSize: size)
+
+        let record = await pipeline.process(dashcam, settings: AppSettings()) { _, _ in }
+
+        XCTAssertEqual(record?.status, .skipped)
+        XCTAssertTrue(record?.detail.contains("could not carry") ?? false, record?.detail ?? "")
+        XCTAssertTrue(library.imported.isEmpty)
     }
 
     func testOriginalIsKeptWhenTheNewVideoIsMissing() async throws {

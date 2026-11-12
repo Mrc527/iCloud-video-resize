@@ -46,6 +46,8 @@ final class ImportModel: ObservableObject {
     /// Videos copied to this iPad, waiting to be re-encoded.
     @Published var waiting: [SourceVideo] = []
     @Published var entries: [String: ImportEntry] = [:]
+    /// The camera of each video on the card, by video id, when the file or its name says it.
+    @Published var cameras: [String: String] = [:]
     @Published var isScanning = false
     @Published var isRunning = false
     @Published var isStopping = false
@@ -59,8 +61,13 @@ final class ImportModel: ObservableObject {
     private let inbox: Inbox
     private let importer: Importer
     private let inboxDirectory: URL
+    /// nil when this build cannot use iCloud.
+    private let sync: ImportSync?
+    private let deviceID: String
     private var folder: URL?
     private var worker: Task<Void, Never>?
+
+    var isSynced: Bool { sync != nil }
 
     init() {
         let fileManager = FileManager.default
@@ -71,11 +78,54 @@ final class ImportModel: ObservableObject {
 
         inboxDirectory = support.appendingPathComponent("inbox")
         inbox = Inbox(directory: inboxDirectory)
-        log = ImportLog(url: support.appendingPathComponent("imports.json"))
+        deviceID = Self.loadDeviceID()
+        log = ImportLog(url: support.appendingPathComponent("imports.json"), device: deviceID)
         importer = Importer(sink: PhotoKitSink(), log: log, workDirectory: work)
+        let cloud = ICloudStore.make()
+        if let cloud {
+            sync = ImportSync(log: log, shared: cloud)
+        } else {
+            sync = nil
+        }
         settings = AppSettings.load()
         entries = log.entries
         waiting = inbox.pending
+
+        cloud?.observe { [weak self] keys in
+            Task { @MainActor in await self?.otherDeviceChanged(keys) }
+        }
+        Task { await otherDeviceChanged(nil) }
+    }
+
+    /// Cards imported on another device: their videos are not selected again.
+    private func otherDeviceChanged(_ keys: [String]?) async {
+        guard let sync else { return }
+        let changed = await Task.detached {
+            let changed = sync.pull(keys: keys)
+            sync.push()  // puts back what the other device's write to the same key dropped
+            return changed
+        }.value
+        guard changed else { return }
+        entries = log.entries
+        if !isRunning {
+            selection.subtract(videos.filter(isDone).map(\.id))
+            for video in inbox.pending where importedElsewhere(video) {
+                inbox.remove(video.id)
+            }
+            waiting = inbox.pending
+        }
+    }
+
+    /// Identifies this install in the import log shared with the other devices.
+    private static func loadDeviceID() -> String {
+        if let id = UserDefaults.standard.string(forKey: "deviceID") { return id }
+        let id = UUID().uuidString
+        UserDefaults.standard.set(id, forKey: "deviceID")
+        return id
+    }
+
+    private func importedElsewhere(_ video: SourceVideo) -> Bool {
+        inbox.importedElsewhere(video.id, log: log, device: deviceID)
     }
 
     // MARK: - Derived data
@@ -129,12 +179,19 @@ final class ImportModel: ObservableObject {
         let result = await Task.detached(priority: .userInitiated) {
             SourceScanner.scan(folder: folder)
         }.value
+        // Another card was chosen meanwhile: read that one instead.
+        guard self.folder == folder else {
+            isScanning = false
+            await scan()
+            return
+        }
         videos = result.videos
         unsupported = result.unsupported
         entries = log.entries
         waiting = inbox.pending
         selection = Set(result.videos.filter { !isDone($0) && !isWaiting($0) }.map(\.id))
         isScanning = false
+        cameras = await Task.detached(priority: .utility) { CardCameras.read(result.videos) }.value
     }
 
     func closeCard() {
@@ -219,6 +276,11 @@ final class ImportModel: ObservableObject {
             let queue = inbox.pending
             for (index, video) in queue.enumerated() {
                 if Task.isCancelled { break }
+                if self.importedElsewhere(video) {
+                    inbox.remove(video.id)
+                    self.waiting = inbox.pending
+                    continue
+                }
                 progress.begin(video.filename, position: "\(index + 1) of \(queue.count)",
                                phase: .encoding)
                 let entry = await importer.importVideo(video, settings: settings) { phase, fraction in
@@ -229,6 +291,9 @@ final class ImportModel: ObservableObject {
                         failures += 1  // the copy stays, so it can be tried again
                     } else {
                         inbox.remove(video.id)
+                    }
+                    if let sync = self.sync {
+                        Task.detached(priority: .utility) { sync.push() }
                     }
                 }
                 self.entries = self.log.entries
