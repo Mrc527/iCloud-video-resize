@@ -93,12 +93,12 @@ final class LibraryModel: ObservableObject {
         let toRead = items.filter { $0.device == nil && cameras.name(for: $0.id) == nil }.map(\.id)
         guard !toRead.isEmpty else { return }
         let library = library
-        let cameras = cameras
+        let cache = cameras
         cameraReader = Task {
             for start in stride(from: 0, to: toRead.count, by: 20) {
                 if Task.isCancelled { return }
                 let found = await library.cameraNames(Array(toRead[start..<min(start + 20, toRead.count)]))
-                cameras.merge(found)
+                cache.merge(found)
                 if found.values.contains(where: { !$0.isEmpty }) { self.camerasRead += 1 }
             }
         }
