@@ -136,6 +136,67 @@ final class PipelineTests: TempDirectoryTestCase {
         XCTAssertEqual(store.record(for: "A")?.status, .deleted)
     }
 
+    func testAnEditedVideoKeepsItsEditedVersion() async throws {
+        try await prepare()
+        let edited = temp.appendingPathComponent("library-FullSizeRender.mov")
+        try await Sample.makeVideo(at: edited, seconds: 1)
+        func size(_ url: URL) throws -> Int64 {
+            Int64(try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0)
+        }
+        library.edits["A"] = edited  // edited after the list was read: item.hasEdit is false
+
+        let record = await pipeline.process(item, settings: AppSettings()) { _, _ in }
+
+        XCTAssertEqual(record?.status, .replaced, record?.detail ?? "")
+        let edit = try XCTUnwrap(library.importedEdits["NEW-A"])
+        XCTAssertEqual(edit.file.lastPathComponent, "FullSizeRender.mov")
+        XCTAssertEqual(edit.adjustments, Data("trim".utf8), "the edit description goes along")
+        XCTAssertLessThan(library.importedEditSizes["NEW-A"] ?? .max, try size(edited),
+                          "the edited version is re-encoded too")
+        let original = try XCTUnwrap(library.files["A"])
+        XCTAssertEqual(record?.originalSize, try size(original) + size(edited))
+    }
+
+    func testAnEditThatCannotBeKeptIsTriedAgainLater() async throws {
+        try await prepare()
+        library.editsNotKept = ["A"]  // for example, Photos has not made the edited version yet
+
+        let record = await pipeline.process(item, settings: AppSettings()) { _, _ in }
+
+        XCTAssertEqual(record?.status, .failed, "not skipped for good: the next scan decides")
+        XCTAssertTrue(library.imported.isEmpty)
+        XCTAssertTrue(library.parked.isEmpty)
+    }
+
+    func testAVideoEditedWhileItWasEncodedIsNotImported() async throws {
+        try await prepare()
+        let edited = temp.appendingPathComponent("library-FullSizeRender.mov")
+        try await Sample.makeVideo(at: edited, seconds: 1)
+        library.edits["A"] = edited
+        library.editedAgain["A"] = Data("crop".utf8)
+
+        let record = await pipeline.process(item, settings: AppSettings()) { _, _ in }
+
+        XCTAssertEqual(record?.status, .failed, "tried again later, with the new edit")
+        XCTAssertTrue(library.imported.isEmpty)
+        XCTAssertTrue(library.parked.isEmpty)
+    }
+
+    func testAnEditPhotosRefusesLeavesTheNewVideoKnown() async throws {
+        try await prepare()
+        let edited = temp.appendingPathComponent("library-FullSizeRender.mov")
+        try await Sample.makeVideo(at: edited, seconds: 1)
+        library.edits["A"] = edited
+        library.failEditSave = true
+
+        let record = await pipeline.process(item, settings: AppSettings()) { _, _ in }
+
+        XCTAssertEqual(record?.status, .needsReview)
+        XCTAssertEqual(record?.newIdentifier, "NEW-A", "the new video without its edit is known")
+        XCTAssertTrue(library.parked.isEmpty)
+        XCTAssertTrue(library.exists("A"))
+    }
+
     func testADroneVideoIsReplacedWithAllItsData() async throws {
         try await prepare()
         let source = temp.appendingPathComponent("library-DJI_0001.MOV")

@@ -3,15 +3,34 @@ import CoreLocation
 import Foundation
 import Photos
 
+/// The edited version of a video, as Photos shows it, and the description of its edit.
+public struct Edit: Sendable {
+    public var file: URL
+    public var adjustments: Data
+
+    public init(file: URL, adjustments: Data) {
+        self.file = file
+        self.adjustments = adjustments
+    }
+}
+
 /// What the pipeline needs from a photo library. The tests use a fake one.
 public protocol VideoLibrary: Sendable {
     func listVideos() async throws -> [VideoItem]
     /// Write the original file into `directory`. Downloads it from iCloud if needed.
     func downloadOriginal(_ item: VideoItem, to directory: URL,
                           progress: @escaping @Sendable (Double) -> Void) async throws -> URL
+    /// Write the edited version into `directory`; nil when the video is not edited.
+    /// Throws `LibraryError.editCannotBeKept` for an edit the new video could not keep.
+    func downloadEdit(_ item: VideoItem, to directory: URL,
+                      progress: @escaping @Sendable (Double) -> Void) async throws -> Edit?
+    /// The description of the video's edit as it is now; nil when the video is not edited.
+    func editAdjustments(_ item: VideoItem) async throws -> Data?
     /// Add the new file to the library, with the date, place, favorite flag
     /// and albums of the original. Returns the identifier of the new video.
     func importReplacement(file: URL, for item: VideoItem) async throws -> String
+    /// Give the new video `edit` as its edit.
+    func saveEdit(_ edit: Edit, on id: String) async throws
     func exists(_ id: String) -> Bool
     /// True when the video is in the iCloud Shared Library. nil when unknown.
     func inSharedLibrary(_ id: String) -> Bool?
@@ -29,12 +48,18 @@ public enum LibraryError: LocalizedError {
     case notFound
     case noVideoResource
     case importFailed
+    case editCannotBeKept
+    case editNotSaved
+    case editChanged
 
     public var errorDescription: String? {
         switch self {
         case .notFound: return "The video is no longer in the Photos library"
         case .noVideoResource: return "Photos has no original file for this video"
         case .importFailed: return "Photos did not create the new video"
+        case .editCannotBeKept: return "Edited in Photos (the edits would be lost)"
+        case .editNotSaved: return "Photos did not keep the edit on the new video"
+        case .editChanged: return "Edited in Photos while it was re-encoded"
         }
     }
 }
@@ -73,7 +98,8 @@ public final class PhotoKitLibrary: VideoLibrary, @unchecked Sendable {
                         ? "Waits for deletion in the album \"\(Pipeline.albumTitle)\""
                         : Self.skipReason(asset, resources),
                     device: Self.camera(asset),
-                    inSharedLibrary: Self.inSharedLibrary(asset)))
+                    inSharedLibrary: Self.inSharedLibrary(asset),
+                    hasEdit: Self.edit(in: Set(resources.map(\.type))) == .keepable))
             }
             return items
         }.value
@@ -93,18 +119,33 @@ public final class PhotoKitLibrary: VideoLibrary, @unchecked Sendable {
         return identifiers
     }
 
+    enum EditKind { case none, keepable, other }
+
+    /// An edit is kept as its edited version: Photos accepts no edit description in its own
+    /// format from another app. What else an edit holds (the base video of an edit made in
+    /// several steps, an edit file Photos does not document) only serves to change the edit
+    /// later, which the old edit settings are lost for anyway. Without an edited version the
+    /// edit is not kept.
+    static func edit(in types: Set<PHAssetResourceType>) -> EditKind {
+        let editTypes: Set<PHAssetResourceType> = [.adjustmentData, .fullSizeVideo, .adjustmentBaseVideo]
+        if types.isDisjoint(with: editTypes) { return .none }
+        return types.contains(.adjustmentData) && types.contains(.fullSizeVideo) ? .keepable : .other
+    }
+
+    /// The format of the edits this app saves: the edited version, and the edit description
+    /// of the original as data, which only Photos could read.
+    static let editFormat = "ch.visin.videoresize.edit"
+
     /// Kinds of video where a re-import would lose something.
     private static func skipReason(_ asset: PHAsset, _ resources: [PHAssetResource]) -> String? {
-        let edited = resources.contains {
-            $0.type == .adjustmentData || $0.type == .fullSizeVideo
-                || $0.type == .adjustmentBaseVideo
-        }
-        if edited { return "Edited in Photos (the edits would be lost)" }
         let subtypes = asset.mediaSubtypes
         if subtypes.contains(.videoHighFrameRate) { return "Slow motion video" }
         if subtypes.contains(.videoTimelapse) { return "Time-lapse video" }
         if subtypes.contains(.videoCinematic) { return "Cinematic video" }
         if subtypes.contains(.spatialMedia) { return "Spatial video" }
+        if edit(in: Set(resources.map(\.type))) == .other {
+            return LibraryError.editCannotBeKept.errorDescription
+        }
         return nil
     }
 
@@ -197,6 +238,55 @@ public final class PhotoKitLibrary: VideoLibrary, @unchecked Sendable {
         return url
     }
 
+    /// The edit resources of a video, nil when it is not edited.
+    private func editResources(_ item: VideoItem) throws
+        -> (edited: PHAssetResource, adjustments: PHAssetResource)? {
+        let resources = PHAssetResource.assetResources(for: try asset(item.id))
+        switch Self.edit(in: Set(resources.map(\.type))) {
+        case .none: return nil
+        case .other: throw LibraryError.editCannotBeKept
+        case .keepable: break
+        }
+        guard let edited = resources.first(where: { $0.type == .fullSizeVideo }),
+              let adjustments = resources.first(where: { $0.type == .adjustmentData })
+        else { throw LibraryError.editCannotBeKept }
+        return (edited, adjustments)
+    }
+
+    private static func data(of resource: PHAssetResource) async throws -> Data {
+        let options = PHAssetResourceRequestOptions()
+        options.isNetworkAccessAllowed = true
+        let data = Box(Data())
+        return try await withCheckedThrowingContinuation { continuation in
+            PHAssetResourceManager.default().requestData(for: resource, options: options) {
+                data.value.append($0)
+            } completionHandler: { error in
+                if let error { continuation.resume(throwing: error) }
+                else { continuation.resume(returning: data.value) }
+            }
+        }
+    }
+
+    public func downloadEdit(_ item: VideoItem, to directory: URL,
+                             progress: @escaping @Sendable (Double) -> Void) async throws -> Edit? {
+        guard let resources = try editResources(item) else { return nil }
+        let adjustments = try await Self.data(of: resources.adjustments)
+
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let options = PHAssetResourceRequestOptions()
+        options.isNetworkAccessAllowed = true
+        options.progressHandler = { progress($0) }
+        let url = directory.appendingPathComponent(resources.edited.originalFilename)
+        try await PHAssetResourceManager.default().writeData(for: resources.edited, toFile: url,
+                                                             options: options)
+        return Edit(file: url, adjustments: adjustments)
+    }
+
+    public func editAdjustments(_ item: VideoItem) async throws -> Data? {
+        guard let resources = try editResources(item) else { return nil }
+        return try await Self.data(of: resources.adjustments)
+    }
+
     public func importReplacement(file: URL, for item: VideoItem) async throws -> String {
         let original = try asset(item.id)
 
@@ -235,6 +325,35 @@ public final class PhotoKitLibrary: VideoLibrary, @unchecked Sendable {
         }
         guard !created.value.isEmpty else { throw LibraryError.importFailed }
         return created.value
+    }
+
+    /// Photos refuses an edit given with the resources of a new video, so it is saved after,
+    /// as an editing app does.
+    public func saveEdit(_ edit: Edit, on id: String) async throws {
+        guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject
+        else { throw LibraryError.importFailed }
+        let options = PHContentEditingInputRequestOptions()
+        options.isNetworkAccessAllowed = true
+        options.canHandleAdjustmentData = { _ in false }
+        let resumed = Box(false)
+        let input: PHContentEditingInput? = await withCheckedContinuation { continuation in
+            asset.requestContentEditingInput(with: options) { input, _ in
+                guard !resumed.value else { return }
+                resumed.value = true
+                continuation.resume(returning: input)
+            }
+        }
+        guard let input else { throw LibraryError.editNotSaved }
+        let output = PHContentEditingOutput(contentEditingInput: input)
+        output.adjustmentData = PHAdjustmentData(formatIdentifier: Self.editFormat,
+                                                 formatVersion: "1", data: edit.adjustments)
+        try FileManager.default.copyItem(at: edit.file, to: output.renderedContentURL)
+        try await PHPhotoLibrary.shared().performChanges {
+            PHAssetChangeRequest(for: asset).contentEditingOutput = output
+        }
+        let saved = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject
+            .map { PHAssetResource.assetResources(for: $0).contains { $0.type == .fullSizeVideo } }
+        guard saved == true else { throw LibraryError.editNotSaved }
     }
 
     public func exists(_ id: String) -> Bool {

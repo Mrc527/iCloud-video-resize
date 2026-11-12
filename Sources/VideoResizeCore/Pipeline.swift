@@ -61,21 +61,39 @@ public final class Pipeline: @unchecked Sendable {
                      progress: @escaping @Sendable (Phase, Double) -> Void) async throws -> Record {
         let transcoder = try Self.transcoder(for: settings)
         try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
-        try checkFreeSpace(for: item, at: work)
+        // Room for the original, the new file, and the copy Photos makes.
+        try checkFreeSpace(item.fileSize * 5 / 2, at: work)
 
+        // The edited version of a video is about a third of its original.
+        let originalShare = item.hasEdit ? 0.75 : 1
         progress(.downloading, 0)
         let source = try await library.downloadOriginal(item, to: work.appendingPathComponent("in")) {
-            progress(.downloading, $0)
+            progress(.downloading, originalShare * $0)
+        }
+        try Task.checkCancellation()
+        // Asked even when the list says unedited: the video may have been edited since. An edit
+        // that cannot be kept fails, and the next scan decides again.
+        let edit = try await library.downloadEdit(item, to: work.appendingPathComponent("edit")) {
+            progress(.downloading, originalShare + (1 - originalShare) * $0)
         }
         try Task.checkCancellation()
         let info = try await Probe.info(source)
+        var editInfo: MediaInfo?
+        if let edit {
+            let probed = try await Probe.info(edit.file)
+            editInfo = probed
+            // Room for the new original and the copy Photos makes, and for the new edited
+            // version, the copy given to Photos and the one Photos makes.
+            try checkFreeSpace(info.fileSize * 3 / 2 + probed.fileSize * 5 / 2, at: work)
+        }
 
-        if info.videoTrackCount != 1 {
+        if info.videoTrackCount != 1 || (editInfo.map { $0.videoTrackCount != 1 } ?? false) {
             return Record(status: .skipped, filename: item.filename, originalSize: info.fileSize,
                           detail: "More than one video track (cinematic or spatial video)")
         }
         do {
             try Carryover.check(source)
+            if let edit { try Carryover.check(edit.file) }
         } catch MediaError.unsupported(let what) {
             return Record(status: .skipped, filename: item.filename, originalSize: info.fileSize,
                           detail: "Kept as it is: a new file could not carry \(what)")
@@ -94,21 +112,51 @@ public final class Pipeline: @unchecked Sendable {
         try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
         let destination = outputDirectory.appendingPathComponent(Reencode.outputName(for: source))
 
+        // Progress of the two videos, by their length.
+        let total = info.duration + (editInfo?.duration ?? 0)
+        let share = total > 0 ? info.duration / total : 1
         progress(.encoding, 0)
         try await Reencode.run(transcoder, source: source, destination: destination, info: info,
-                               quality: settings.quality) { progress(.encoding, $0) }
+                               quality: settings.quality) { progress(.encoding, share * $0) }
+        var newEdit: Edit?
+        if let edit, let editInfo {
+            let directory = work.appendingPathComponent("out-edit")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let file = directory.appendingPathComponent(Reencode.outputName(for: edit.file))
+            try await Reencode.run(transcoder, source: edit.file, destination: file, info: editInfo,
+                                   quality: settings.quality) {
+                progress(.encoding, share + (1 - share) * $0)
+            }
+            newEdit = Edit(file: file, adjustments: edit.adjustments)
+        }
         try Task.checkCancellation()
 
         progress(.verifying, 0)
         let output = try await Verifier.verify(source: info, output: destination, original: source,
                                                fullDecode: settings.fullVerify) {
-            progress(.verifying, $0)
+            progress(.verifying, share * $0)
         }
-        let saving = 100 * (1 - Double(output.fileSize) / Double(max(info.fileSize, 1)))
+        var oldSize = info.fileSize
+        var newSize = output.fileSize
+        if let edit, let editInfo, let newEdit {
+            let editOutput = try await Verifier.verify(source: editInfo, output: newEdit.file,
+                                                       original: edit.file,
+                                                       fullDecode: settings.fullVerify) {
+                progress(.verifying, share + (1 - share) * $0)
+            }
+            oldSize += editInfo.fileSize
+            newSize += editOutput.fileSize
+        }
+        let saving = 100 * (1 - Double(newSize) / Double(max(oldSize, 1)))
         if saving < settings.minSavingPercent {
-            return Record(status: .notWorth, filename: item.filename, originalSize: info.fileSize,
-                          newSize: output.fileSize,
+            return Record(status: .notWorth, filename: item.filename, originalSize: oldSize,
+                          newSize: newSize,
                           detail: String(format: "Saving too small (%.0f%%)", saving))
+        }
+        // The video may have been edited in Photos meanwhile: the new video would not have
+        // that edit.
+        guard try await library.editAdjustments(item) == edit?.adjustments else {
+            throw LibraryError.editChanged
         }
         try Task.checkCancellation()
 
@@ -119,14 +167,20 @@ public final class Pipeline: @unchecked Sendable {
         // is no longer cancelled half way.
         progress(.importing, 0)
         var record = Record(status: .importing, filename: item.filename,
-                            originalSize: info.fileSize, newSize: output.fileSize)
+                            originalSize: oldSize, newSize: newSize)
         store.set(record, for: item.id)
         let newIdentifier = try await library.importReplacement(file: destination, for: item)
         record.newIdentifier = newIdentifier
         store.set(record, for: item.id)
+        // A separate step: if it fails, the record already names the new video.
+        if let newEdit { try await library.saveEdit(newEdit, on: newIdentifier) }
 
         guard library.exists(newIdentifier) else { throw LibraryError.importFailed }
         guard library.exists(item.id) else { throw LibraryError.notFound }
+        // Edited during the import: the original, with that edit, is not parked for deletion.
+        guard try await library.editAdjustments(item) == edit?.adjustments else {
+            throw LibraryError.editChanged
+        }
         try await library.addToAlbum([item.id], albumTitle: Self.albumTitle)
 
         record.status = .replaced
@@ -158,11 +212,10 @@ public final class Pipeline: @unchecked Sendable {
         }
     }
 
-    private func checkFreeSpace(for item: VideoItem, at url: URL) throws {
+    private func checkFreeSpace(_ needed: Int64, at url: URL) throws {
         let values = try url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
         guard let free = values.volumeAvailableCapacityForImportantUsage else { return }
-        // Room for the original, the new file, and the copy Photos makes.
-        if free < item.fileSize * 5 / 2 {
+        if free < needed {
             throw MediaError.unsupported("not enough free disk space for this video")
         }
     }

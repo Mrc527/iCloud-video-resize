@@ -171,6 +171,12 @@ list. When you press **Start**, for each video, biggest first:
    and albums as the original.
 6. **Park** the original in the album `Video Resize: originals to delete`.
 
+A video edited in Photos keeps its edit: its original and its edited version
+are both re-encoded and checked, and the new video shows the edited version.
+**Revert to Original** in Photos still gives the whole video. Photos does not
+let another app save an edit in its own format, so the old edit settings are
+gone: to change the edit, revert to the original in Photos and edit again.
+
 The app never deletes anything by itself. When you are happy with the result,
 press **Delete originals**. The app checks again that each new video is still
 in Photos, then moves the originals to Recently Deleted. macOS asks you to
@@ -189,7 +195,8 @@ does, see [SD Video Import](#sd-video-import-ipad). The copies wait in
 
 ## What it leaves alone
 
-- Videos edited in Photos (the edits would be lost)
+- Videos edited in Photos that have no edited version yet (the edits would be
+  lost)
 - Slow motion, time-lapse, cinematic and spatial videos
 - Live Photos (they are photos, not videos)
 - Hidden videos and shared albums

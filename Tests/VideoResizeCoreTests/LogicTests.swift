@@ -1,4 +1,5 @@
 import XCTest
+import Photos
 @testable import VideoResizeCore
 
 final class BitrateTests: XCTestCase {
@@ -182,5 +183,28 @@ final class FFmpegArgumentsTests: XCTestCase {
         XCTAssertEqual(value(after: "-f", in: args), "mov")
         XCTAssertEqual(value(after: "-tag:v", in: args), "hvc1")
         XCTAssertEqual(value(after: "-crf", in: args), "27")
+    }
+}
+
+final class EditKindTests: XCTestCase {
+    func testWhichEditsAreKept() throws {
+        func kind(_ types: [PHAssetResourceType]) -> PhotoKitLibrary.EditKind {
+            PhotoKitLibrary.edit(in: Set(types))
+        }
+        XCTAssertEqual(kind([.video]), .none)
+        XCTAssertEqual(kind([.video, .audio]), .none)
+        XCTAssertEqual(kind([.video, .adjustmentData, .fullSizeVideo]), .keepable)
+        XCTAssertEqual(kind([.video, .fullSizePhoto, .adjustmentData, .fullSizeVideo]), .keepable)
+        // Edited in several steps, or with an edit file Photos does not document (seen as 16):
+        // the edited version is still there.
+        XCTAssertEqual(kind([.video, .adjustmentData, .fullSizeVideo, .adjustmentBaseVideo]), .keepable)
+        let undocumented = try XCTUnwrap(PHAssetResourceType(rawValue: 16))
+        XCTAssertEqual(kind([.video, .fullSizePhoto, .adjustmentData, .fullSizeVideo, undocumented]),
+                       .keepable)
+        // No edited version: not rendered by Photos yet, or a slow motion video.
+        XCTAssertEqual(kind([.video, .adjustmentData]), .other)
+        XCTAssertEqual(kind([.video, .fullSizePhoto, .adjustmentData]), .other)
+        XCTAssertEqual(kind([.video, .fullSizeVideo]), .other)
+        XCTAssertEqual(kind([.video, .adjustmentBaseVideo]), .other)
     }
 }

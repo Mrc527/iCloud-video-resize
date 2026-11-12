@@ -209,7 +209,13 @@ final class FakeLibrary: VideoLibrary, @unchecked Sendable {
     var parked: [String] = []
     var shared: Set<String> = []
     var toMove: Set<String> = []  // in the album of the videos to move to the Shared Library
+    var edits: [String: URL] = [:]  // original -> its edited version
+    var editsNotKept: Set<String> = []
+    var editedAgain: [String: Data] = [:]  // the edit description after the download
+    var importedEdits: [String: Edit] = [:]  // new identifier -> its edit
+    var importedEditSizes: [String: Int64] = [:]
     var failImport = false
+    var failEditSave = false
 
     func add(_ id: String, file: URL) {
         files[id] = file
@@ -227,6 +233,22 @@ final class FakeLibrary: VideoLibrary, @unchecked Sendable {
         return copy
     }
 
+    func downloadEdit(_ item: VideoItem, to directory: URL,
+                      progress: @escaping @Sendable (Double) -> Void) async throws -> Edit? {
+        if editsNotKept.contains(item.id) { throw LibraryError.editCannotBeKept }
+        guard let file = edits[item.id] else { return nil }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let copy = directory.appendingPathComponent("FullSizeRender.mov")
+        try FileManager.default.copyItem(at: file, to: copy)
+        return Edit(file: copy, adjustments: Data("trim".utf8))
+    }
+
+    func editAdjustments(_ item: VideoItem) async throws -> Data? {
+        if editsNotKept.contains(item.id) { throw LibraryError.editCannotBeKept }
+        guard edits[item.id] != nil else { return nil }
+        return editedAgain[item.id] ?? Data("trim".utf8)
+    }
+
     func importReplacement(file: URL, for item: VideoItem) async throws -> String {
         if failImport { throw LibraryError.importFailed }
         let id = "NEW-" + item.id
@@ -234,6 +256,13 @@ final class FakeLibrary: VideoLibrary, @unchecked Sendable {
         present.insert(id)
         if shared.contains(item.id) { toMove.insert(id) }  // a new video is never shared
         return id
+    }
+
+    func saveEdit(_ edit: Edit, on id: String) async throws {
+        if failEditSave { throw LibraryError.editNotSaved }
+        importedEdits[id] = edit
+        // The work folder is gone after the import.
+        importedEditSizes[id] = Int64(try edit.file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0)
     }
 
     func exists(_ id: String) -> Bool { present.contains(id) }

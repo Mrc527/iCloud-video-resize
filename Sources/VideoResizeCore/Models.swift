@@ -89,10 +89,12 @@ public struct VideoItem: Identifiable, Equatable, Sendable {
     public var device: String?
     /// True when the video is in the iCloud Shared Library. nil when unknown.
     public var inSharedLibrary: Bool?
+    /// Edited in Photos, in a way the new video can keep.
+    public var hasEdit: Bool
 
     public init(id: String, filename: String, creationDate: Date?, duration: Double,
                 width: Int, height: Int, fileSize: Int64, skipReason: String? = nil,
-                device: String? = nil, inSharedLibrary: Bool? = nil) {
+                device: String? = nil, inSharedLibrary: Bool? = nil, hasEdit: Bool = false) {
         self.id = id
         self.filename = filename
         self.creationDate = creationDate
@@ -103,6 +105,7 @@ public struct VideoItem: Identifiable, Equatable, Sendable {
         self.skipReason = skipReason
         self.device = device
         self.inSharedLibrary = inSharedLibrary
+        self.hasEdit = hasEdit
     }
 
     /// Whole-file bit rate in bits per second. Close enough to the video bit rate.
