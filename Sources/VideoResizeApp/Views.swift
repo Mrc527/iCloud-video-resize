@@ -68,6 +68,7 @@ struct ContentView: View {
             }
         } message: {
             Text("The originals move to Recently Deleted and can be recovered for 30 days. "
+                + (model.waitingToMove > 0 ? "Originals in the Shared Library stay until their new video is moved there. " : "")
                 + "macOS will ask you to confirm once more.")
         }
     }
@@ -144,6 +145,11 @@ struct SummaryBar: View {
             }
             stat("Space saved", Format.bytes(model.savedBytes))
             stat("Originals to delete", "\(model.waitingForDeletion)")
+            if model.waitingToMove > 0 {
+                stat("To move to Shared Library", "\(model.waitingToMove)")
+                    .help("In Photos, move the videos of the album \"\(Pipeline.moveAlbumTitle)\" "
+                        + "to the Shared Library. Until then their originals are not deleted.")
+            }
             Spacer()
             if model.isScanning {
                 ProgressView().controlSize(.small)

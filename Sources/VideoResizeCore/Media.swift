@@ -173,9 +173,12 @@ public enum ISO6709 {
 public enum Verifier {
     /// Throws unless the new file is a faithful copy of the original. With `original`, it
     /// also checks that every box, tag and extra track of the original is in the new file.
+    /// `progress` follows the full decode, the long part.
     @discardableResult
     public static func verify(source: MediaInfo, output url: URL, original: URL? = nil,
-                              fullDecode: Bool) async throws -> MediaInfo {
+                              fullDecode: Bool,
+                              progress: @escaping @Sendable (Double) -> Void = { _ in })
+        async throws -> MediaInfo {
         if let original {
             let missing = try Carryover.differences(original: original, output: url)
             if !missing.isEmpty {
@@ -212,17 +215,21 @@ public enum Verifier {
             throw MediaError.verification("the GPS position was lost")
         }
         if fullDecode {
-            try await decodeAll(url)
+            try await decodeAll(url, progress: progress)
         }
         return output
     }
 
     /// Decode every frame, to be sure the file is not damaged.
-    private static func decodeAll(_ url: URL) async throws {
+    private static func decodeAll(_ url: URL,
+                                  progress: @escaping @Sendable (Double) -> Void) async throws {
         let asset = AVURLAsset(url: url)
         guard let track = try await asset.loadTracks(withMediaType: .video).first else {
             throw MediaError.noVideoTrack
         }
+        let (rate, timeRange) = try await track.load(.nominalFrameRate, .timeRange)
+        let estimate = Double(rate) * timeRange.duration.seconds
+        let expected = estimate.isFinite ? max(estimate, 1) : 1
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
             kCVPixelBufferPixelFormatTypeKey as String:
@@ -237,7 +244,10 @@ public enum Verifier {
 
         let frames = await Task.detached(priority: .utility) { () -> Int in
             var count = 0
-            while output.copyNextSampleBuffer() != nil { count += 1 }
+            while output.copyNextSampleBuffer() != nil {
+                count += 1
+                if count % 30 == 0 { progress(min(Double(count) / expected, 1)) }
+            }
             return count
         }.value
 

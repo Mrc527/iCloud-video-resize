@@ -133,6 +133,16 @@ final class AppModel: ObservableObject {
         records.values.filter { $0.status == .replaced }.count
     }
 
+    /// New videos of Shared Library originals that wait in the album to be moved there by hand.
+    var waitingToMove: Int {
+        let inShared = Set(items.filter { $0.inSharedLibrary == true }.map(\.id))
+        let notShared = Set(items.filter { $0.inSharedLibrary == false }.map(\.id))
+        return records.filter { id, record in
+            record.status == .replaced && inShared.contains(id)
+                && record.newIdentifier.map(notShared.contains) == true
+        }.count
+    }
+
     var savedBytes: Int64 {
         records.values
             .filter { $0.status == .replaced || $0.status == .deleted }
@@ -189,7 +199,24 @@ final class AppModel: ObservableObject {
             records = store.records
         } catch {
             message = "Cannot read the Photos library: \(error.localizedDescription)"
+            return
         }
+        await gatherVideosToMove()
+    }
+
+    /// Also gathers the new videos made before the album of the videos to move existed.
+    private func gatherVideosToMove() async {
+        let note: String
+        do {
+            let added = try await pipeline.gatherVideosToMove()
+            guard added > 0 else { return }
+            note = "\(added) new video(s) added to the album \"\(Pipeline.moveAlbumTitle)\": "
+                + "their original is in the Shared Library. In Photos, move them there."
+        } catch {
+            note = "Could not add videos to the album \"\(Pipeline.moveAlbumTitle)\": "
+                + error.localizedDescription
+        }
+        message = [message, note].compactMap { $0 }.joined(separator: "\n\n")
     }
 
     /// Photos knows the camera only from Apple's tags. For the other videos it is read from
@@ -318,6 +345,11 @@ final class AppModel: ObservableObject {
             var text = "\(result.deleted) original(s) moved to Recently Deleted."
             if result.heldBack > 0 {
                 text += " \(result.heldBack) kept, because the new video was not found in Photos."
+            }
+            if result.notMoved > 0 {
+                text += " \(result.notMoved) kept, because they are in the Shared Library and their "
+                    + "new video is not there yet. In Photos, move the videos of the album "
+                    + "\"\(Pipeline.moveAlbumTitle)\" to the Shared Library, then delete again."
             }
             message = text
         } catch {

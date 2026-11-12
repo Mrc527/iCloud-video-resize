@@ -256,6 +256,8 @@ struct BottomBar: View {
                         }
                         Text(progress.phase == .copying && !model.cardCanBeRemoved
                              ? "Copying from the card. Do not remove it yet."
+                             : progress.canLeave
+                             ? "You can leave the app: the work goes on, and iOS shows its progress."
                              : "Keep the app on screen while it works.")
                             .font(.caption).foregroundStyle(.secondary)
                     }

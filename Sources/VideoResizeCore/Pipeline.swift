@@ -11,6 +11,8 @@ public enum Phase: String, Sendable {
 /// The work done on one video: download, encode, verify, replace.
 public final class Pipeline: @unchecked Sendable {
     public static let albumTitle = "Video Resize: originals to delete"
+    /// New videos of Shared Library originals: an app can add only to the Personal Library.
+    public static let moveAlbumTitle = "Video Resize: move to Shared Library"
 
     private let library: VideoLibrary
     private let store: StateStore
@@ -99,7 +101,9 @@ public final class Pipeline: @unchecked Sendable {
 
         progress(.verifying, 0)
         let output = try await Verifier.verify(source: info, output: destination, original: source,
-                                               fullDecode: settings.fullVerify)
+                                               fullDecode: settings.fullVerify) {
+            progress(.verifying, $0)
+        }
         let saving = 100 * (1 - Double(output.fileSize) / Double(max(info.fileSize, 1)))
         if saving < settings.minSavingPercent {
             return Record(status: .notWorth, filename: item.filename, originalSize: info.fileSize,
@@ -122,7 +126,8 @@ public final class Pipeline: @unchecked Sendable {
         store.set(record, for: item.id)
 
         guard library.exists(newIdentifier) else { throw LibraryError.importFailed }
-        try await library.park(original: item.id, albumTitle: Self.albumTitle)
+        guard library.exists(item.id) else { throw LibraryError.notFound }
+        try await library.addToAlbum([item.id], albumTitle: Self.albumTitle)
 
         record.status = .replaced
         record.detail = String(format: "Saved %.0f%%", saving)
@@ -162,22 +167,52 @@ public final class Pipeline: @unchecked Sendable {
         }
     }
 
+    /// Put in the album of the videos to move every new video whose original is in the Shared
+    /// Library and which is not there yet, also those made before that album existed.
+    /// Returns how many were added to the album.
+    public func gatherVideosToMove() async throws -> Int {
+        let ids = store.records.compactMap { id, record -> String? in
+            guard record.status == .replaced, let newIdentifier = record.newIdentifier,
+                  library.inSharedLibrary(id) == true,
+                  library.inSharedLibrary(newIdentifier) == false
+            else { return nil }
+            return newIdentifier
+        }
+        guard !ids.isEmpty else { return 0 }
+        return try await library.addToAlbum(ids, albumTitle: Self.moveAlbumTitle)
+    }
+
     /// Delete the originals whose replacement is still in Photos.
     ///
-    /// An original whose replacement is missing is held back and never deleted.
-    public func deleteOriginals() async throws -> (deleted: Int, heldBack: Int) {
+    /// An original whose replacement is missing is held back and never deleted. So is an
+    /// original in the Shared Library whose replacement is not there yet: deleting it would
+    /// take the video away from the other members.
+    public func deleteOriginals() async throws -> (deleted: Int, heldBack: Int, notMoved: Int) {
         var safe: [String] = []
+        var moved: [String] = []
         var heldBack = 0
+        var notMoved = 0
         for (id, record) in store.records where record.status == .replaced {
             guard let newIdentifier = record.newIdentifier, library.exists(newIdentifier) else {
                 heldBack += 1
                 continue
             }
-            if library.exists(id) {
-                safe.append(id)
-            } else {
+            guard library.exists(id) else {
                 mark(id, record, detail: "The original was already deleted")
+                continue
             }
+            if library.inSharedLibrary(id) == true {
+                guard library.inSharedLibrary(newIdentifier) == true else {
+                    notMoved += 1
+                    continue
+                }
+                moved.append(newIdentifier)
+            }
+            safe.append(id)
+        }
+        // Only what is still to move stays in that album.
+        if !moved.isEmpty {
+            try? await library.removeFromAlbum(moved, albumTitle: Self.moveAlbumTitle)
         }
         if !safe.isEmpty {
             try await library.delete(safe)
@@ -187,7 +222,7 @@ public final class Pipeline: @unchecked Sendable {
                 }
             }
         }
-        return (safe.count, heldBack)
+        return (safe.count, heldBack, notMoved)
     }
 
     /// Undo a replacement: delete the new video and take the original out of the album.
@@ -211,7 +246,7 @@ public final class Pipeline: @unchecked Sendable {
         if !newVideos.isEmpty { try await library.delete(newVideos) }
 
         for id in originals {
-            try await library.unpark(original: id, albumTitle: Self.albumTitle)
+            try await library.removeFromAlbum([id], albumTitle: Self.albumTitle)
             guard var record = store.record(for: id) else { continue }
             record.status = .restored
             record.newIdentifier = nil

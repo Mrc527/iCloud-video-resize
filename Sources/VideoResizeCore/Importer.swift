@@ -210,7 +210,9 @@ public final class Importer: @unchecked Sendable {
                 progress(.verifying, 0)
                 let output = try await Verifier.verify(source: info, output: destination,
                                                        original: video.url,
-                                                       fullDecode: settings.fullVerify)
+                                                       fullDecode: settings.fullVerify) {
+                    progress(.verifying, $0)
+                }
                 let saving = 100 * (1 - Double(output.fileSize) / Double(max(info.fileSize, 1)))
                 if saving >= settings.minSavingPercent {
                     try Task.checkCancellation()
@@ -313,14 +315,28 @@ public final class Inbox: @unchecked Sendable {
     }
 
     /// Copy a video from the card. The file on the card is not changed.
-    public func add(_ video: SourceVideo) throws {
+    /// `progress` gets the share copied about once a second.
+    public func add(_ video: SourceVideo,
+                    progress: @escaping @Sendable (Double) -> Void = { _ in }) throws {
         if contains(video.id) { return }
         let item = Item(filename: video.filename, fileSize: video.fileSize,
                         modified: video.modified, folder: UUID().uuidString, copied: Date())
         let folder = directory.appendingPathComponent(item.folder)
+        let destination = file(item)
+        // The copy gives no progress: the size of the file being written tells it.
+        let watcher = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        watcher.schedule(deadline: .now() + 1, repeating: 1)
+        watcher.setEventHandler {
+            // Not URL.resourceValues: it keeps returning the first size it read.
+            let size = (try? FileManager.default.attributesOfItem(atPath: destination.path))?[.size]
+                as? Int64 ?? 0
+            progress(min(Double(size) / Double(max(video.fileSize, 1)), 1))
+        }
+        watcher.resume()
+        defer { watcher.cancel() }
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-            try FileManager.default.copyItem(at: video.url, to: file(item))
+            try FileManager.default.copyItem(at: video.url, to: destination)
         } catch {
             try? FileManager.default.removeItem(at: folder)  // no half copied files
             throw error

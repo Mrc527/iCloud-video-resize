@@ -62,6 +62,7 @@ struct LibraryScreen: View {
             }
         } message: {
             Text("The originals move to Recently Deleted and can be recovered for 30 days. "
+                + (model.waitingToMove > 0 ? "Originals in the Shared Library stay until their new video is moved there. " : "")
                 + "iPadOS will ask you to confirm once more.")
         }
         .onChange(of: scenePhase) { _, phase in
@@ -208,6 +209,14 @@ struct LibrarySummary: View {
                 }
                 stat("Space saved", Format.bytes(model.savedBytes))
                 stat("Originals to delete", "\(model.waitingForDeletion)")
+                if model.waitingToMove > 0 {
+                    stat("To move to Shared Library", "\(model.waitingToMove)")
+                }
+            }
+            if model.waitingToMove > 0 {
+                Text("In Photos, move the videos of the album \"\(Pipeline.moveAlbumTitle)\" to "
+                    + "the Shared Library. Until then their originals are not deleted.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             if let filename = progress.filename {
                 VStack(alignment: .leading, spacing: 4) {
@@ -219,7 +228,9 @@ struct LibrarySummary: View {
                     } else {
                         ProgressView().progressViewStyle(.linear)
                     }
-                    Text("Keep the app on screen while it works.")
+                    Text(progress.canLeave
+                         ? "You can leave the app: the work goes on, and iOS shows its progress."
+                         : "Keep the app on screen while it works.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }

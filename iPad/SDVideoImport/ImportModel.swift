@@ -10,6 +10,8 @@ final class ProgressModel: ObservableObject {
     @Published var phase: Phase = .copying
     @Published var fraction: Double = 0
     @Published var position = ""
+    /// True when iOS lets the work go on with the app in the background.
+    @Published var canLeave = false
 
     func begin(_ filename: String, position: String, phase: Phase) {
         self.filename = filename
@@ -25,6 +27,7 @@ final class ProgressModel: ObservableObject {
 
     func end() {
         filename = nil
+        canLeave = false
     }
 }
 
@@ -66,6 +69,7 @@ final class ImportModel: ObservableObject {
     private let deviceID: String
     private var folder: URL?
     private var worker: Task<Void, Never>?
+    private let background = BackgroundWork()
 
     var isSynced: Bool { sync != nil }
 
@@ -249,17 +253,34 @@ final class ImportModel: ObservableObject {
         let importer = importer
         let inbox = inbox
         let progress = progress
+        let background = background
+        let count = toCopy.count + waiting.count
+        background.begin(title: "Importing videos", subtitle: "\(count) video(s)",
+                         onStart: { progress.canLeave = true },
+                         onExpire: { [weak self] in
+                             progress.canLeave = false
+                             self?.backgroundTimeEnded()
+                         })
+        // Copying is fast: a tenth of the progress.
+        let copyShare = toCopy.isEmpty ? 0.0 : 0.1
 
         worker = Task {
             // Step 1: copy from the card. Fast.
             var copyErrors: [String] = []
             for (index, video) in toCopy.enumerated() {
                 if Task.isCancelled { break }
-                progress.begin(video.filename, position: "\(index + 1) of \(toCopy.count)",
-                               phase: .copying)
+                let position = "\(index + 1) of \(toCopy.count)"
+                progress.begin(video.filename, position: position, phase: .copying)
+                let subtitle = "Copying \(position): \(video.filename)"
+                let share = { (fraction: Double) in
+                    copyShare * (Double(index) + fraction) / Double(toCopy.count)
+                }
+                background.report(share(0), subtitle: subtitle)
                 do {
                     try await Task.detached(priority: .userInitiated) {
-                        try inbox.add(video)
+                        try inbox.add(video) { fraction in
+                            Task { @MainActor in background.report(share(fraction), subtitle: subtitle) }
+                        }
                     }.value
                     self.selection.remove(video.id)
                 } catch {
@@ -281,10 +302,19 @@ final class ImportModel: ObservableObject {
                     self.waiting = inbox.pending
                     continue
                 }
-                progress.begin(video.filename, position: "\(index + 1) of \(queue.count)",
-                               phase: .encoding)
+                let position = "\(index + 1) of \(queue.count)"
+                progress.begin(video.filename, position: position, phase: .encoding)
+                let subtitle = "\(position): \(video.filename)"
+                let share = { (phase: Phase, fraction: Double) in
+                    copyShare + (1 - copyShare)
+                        * BackgroundWork.share(index, of: queue.count, phase, fraction)
+                }
+                background.report(share(.encoding, 0), subtitle: subtitle)
                 let entry = await importer.importVideo(video, settings: settings) { phase, fraction in
-                    Task { @MainActor in progress.update(phase, fraction) }
+                    Task { @MainActor in
+                        progress.update(phase, fraction)
+                        background.report(share(phase, fraction), subtitle: subtitle)
+                    }
                 }
                 if let entry {
                     if entry.outcome == .failed {
@@ -301,6 +331,7 @@ final class ImportModel: ObservableObject {
             }
 
             progress.end()
+            background.end(success: !Task.isCancelled)
             UIApplication.shared.isIdleTimerDisabled = false
             self.isRunning = false
             self.isStopping = false
@@ -335,13 +366,21 @@ final class ImportModel: ObservableObject {
         worker?.cancel()
     }
 
-    /// iPadOS stops the video encoder when the app is not on screen.
+    /// Without a background task from iOS, the video encoder stops when the app is not on screen.
     /// Stopping cleanly keeps the current video for the next run.
     func appWentToBackground() {
-        guard isRunning, !isStopping else { return }
+        guard isRunning, !isStopping, !background.isActive else { return }
         stop()
         message = "The import was paused because the app was closed. Nothing is lost: "
             + "the videos already copied are on this iPad. Open the app and press Continue."
+    }
+
+    /// iOS ended the background time, or the person stopped the work from its progress.
+    private func backgroundTimeEnded() {
+        guard isRunning, !isStopping else { return }
+        stop()
+        message = "The import in the background was stopped. Nothing is lost: the videos "
+            + "already copied are on this device. Press Continue to go on."
     }
 }
 

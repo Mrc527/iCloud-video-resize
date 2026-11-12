@@ -207,6 +207,8 @@ final class FakeLibrary: VideoLibrary, @unchecked Sendable {
     var present: Set<String> = []
     var imported: [String: String] = [:]  // new identifier -> file name
     var parked: [String] = []
+    var shared: Set<String> = []
+    var toMove: Set<String> = []  // in the album of the videos to move to the Shared Library
     var failImport = false
 
     func add(_ id: String, file: URL) {
@@ -230,15 +232,37 @@ final class FakeLibrary: VideoLibrary, @unchecked Sendable {
         let id = "NEW-" + item.id
         imported[id] = file.lastPathComponent
         present.insert(id)
+        if shared.contains(item.id) { toMove.insert(id) }  // a new video is never shared
         return id
     }
 
     func exists(_ id: String) -> Bool { present.contains(id) }
 
-    func park(original id: String, albumTitle: String) async throws { parked.append(id) }
+    func inSharedLibrary(_ id: String) -> Bool? { shared.contains(id) }
 
-    func unpark(original id: String, albumTitle: String) async throws {
-        parked.removeAll { $0 == id }
+    @discardableResult
+    func addToAlbum(_ ids: [String], albumTitle: String) async throws -> Int {
+        let missing = ids.filter(present.contains)
+        switch albumTitle {
+        case Pipeline.albumTitle:
+            let added = missing.filter { !parked.contains($0) }
+            parked += added
+            return added.count
+        case Pipeline.moveAlbumTitle:
+            let added = Set(missing).subtracting(toMove)
+            toMove.formUnion(added)
+            return added.count
+        default:
+            return 0
+        }
+    }
+
+    func removeFromAlbum(_ ids: [String], albumTitle: String) async throws {
+        switch albumTitle {
+        case Pipeline.albumTitle: parked.removeAll { ids.contains($0) }
+        case Pipeline.moveAlbumTitle: toMove.subtract(ids)
+        default: break
+        }
     }
 
     func delete(_ ids: [String]) async throws { present.subtract(ids) }

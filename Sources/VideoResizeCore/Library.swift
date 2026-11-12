@@ -13,10 +13,14 @@ public protocol VideoLibrary: Sendable {
     /// and albums of the original. Returns the identifier of the new video.
     func importReplacement(file: URL, for item: VideoItem) async throws -> String
     func exists(_ id: String) -> Bool
-    /// Put the original in an album, where it waits for deletion.
-    func park(original id: String, albumTitle: String) async throws
-    /// Take the original out of that album again.
-    func unpark(original id: String, albumTitle: String) async throws
+    /// True when the video is in the iCloud Shared Library. nil when unknown.
+    func inSharedLibrary(_ id: String) -> Bool?
+    /// Add videos to the album with this title, made when missing. Returns how many were
+    /// not in it yet.
+    @discardableResult
+    func addToAlbum(_ ids: [String], albumTitle: String) async throws -> Int
+    /// Take videos out of every album with this title.
+    func removeFromAlbum(_ ids: [String], albumTitle: String) async throws
     /// Move videos to Recently Deleted. macOS asks the user to confirm.
     func delete(_ ids: [String]) async throws
 }
@@ -68,7 +72,8 @@ public final class PhotoKitLibrary: VideoLibrary, @unchecked Sendable {
                     skipReason: parked.contains(asset.localIdentifier)
                         ? "Waits for deletion in the album \"\(Pipeline.albumTitle)\""
                         : Self.skipReason(asset, resources),
-                    device: Self.camera(asset)))
+                    device: Self.camera(asset),
+                    inSharedLibrary: Self.inSharedLibrary(asset)))
             }
             return items
         }.value
@@ -143,6 +148,32 @@ public final class PhotoKitLibrary: VideoLibrary, @unchecked Sendable {
         return parts.isEmpty ? nil : parts.joined(separator: " ")
     }
 
+    // PhotoKit has no public way to tell the Shared Library from the Personal Library.
+    // This key is not documented. Without it the library is unknown, and nothing is
+    // held back for it.
+    private static func inSharedLibrary(_ asset: PHAsset) -> Bool? {
+        let key = "participatesInLibraryScope"
+        guard asset.responds(to: NSSelectorFromString(key)) else { return nil }
+        return (asset.value(forKey: key) as? NSNumber)?.boolValue
+    }
+
+    public func inSharedLibrary(_ id: String) -> Bool? {
+        guard let asset = try? asset(id) else { return nil }
+        return Self.inSharedLibrary(asset)
+    }
+
+    private static func album(titled title: String) -> PHAssetCollection? {
+        var found: PHAssetCollection?
+        PHAssetCollection.fetchAssetCollections(with: .album, subtype: .albumRegular, options: nil)
+            .enumerateObjects { album, _, stop in
+                if album.localizedTitle == title {
+                    found = album
+                    stop.pointee = true
+                }
+            }
+        return found
+    }
+
     private func asset(_ id: String) throws -> PHAsset {
         guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject
         else { throw LibraryError.notFound }
@@ -176,6 +207,10 @@ public final class PhotoKitLibrary: VideoLibrary, @unchecked Sendable {
             }
         let targets = albums
         let created = Box("")
+        // An app can only add to the Personal Library. The person moves the new video to the
+        // Shared Library from this album; until then the original is not deleted.
+        let toMove = Self.inSharedLibrary(original) == true
+        let moveAlbum = toMove ? Self.album(titled: Pipeline.moveAlbumTitle) : nil
 
         try await PHPhotoLibrary.shared().performChanges {
             let request = PHAssetCreationRequest.forAsset()
@@ -190,6 +225,12 @@ public final class PhotoKitLibrary: VideoLibrary, @unchecked Sendable {
             created.value = placeholder.localIdentifier
             for album in targets {
                 PHAssetCollectionChangeRequest(for: album)?.addAssets([placeholder] as NSArray)
+            }
+            if toMove {
+                let request = moveAlbum.flatMap { PHAssetCollectionChangeRequest(for: $0) }
+                    ?? PHAssetCollectionChangeRequest.creationRequestForAssetCollection(
+                        withTitle: Pipeline.moveAlbumTitle)
+                request.addAssets([placeholder] as NSArray)
             }
         }
         guard !created.value.isEmpty else { throw LibraryError.importFailed }
@@ -243,18 +284,18 @@ public final class PhotoKitLibrary: VideoLibrary, @unchecked Sendable {
         }
     }
 
-    public func park(original id: String, albumTitle: String) async throws {
-        let original = try asset(id)
-
-        var found: PHAssetCollection?
-        PHAssetCollection.fetchAssetCollections(with: .album, subtype: .albumRegular, options: nil)
-            .enumerateObjects { album, _, stop in
-                if album.localizedTitle == albumTitle {
-                    found = album
-                    stop.pointee = true
-                }
+    @discardableResult
+    public func addToAlbum(_ ids: [String], albumTitle: String) async throws -> Int {
+        let existing = Self.album(titled: albumTitle)
+        var inAlbum = Set<String>()
+        if let existing {
+            PHAsset.fetchAssets(in: existing, options: nil).enumerateObjects { asset, _, _ in
+                inAlbum.insert(asset.localIdentifier)
             }
-        let existing = found
+        }
+        let missing = PHAsset.fetchAssets(
+            withLocalIdentifiers: ids.filter { !inAlbum.contains($0) }, options: nil)
+        guard missing.count > 0 else { return 0 }
 
         try await PHPhotoLibrary.shared().performChanges {
             let request: PHAssetCollectionChangeRequest?
@@ -264,12 +305,14 @@ public final class PhotoKitLibrary: VideoLibrary, @unchecked Sendable {
                 request = PHAssetCollectionChangeRequest
                     .creationRequestForAssetCollection(withTitle: albumTitle)
             }
-            request?.addAssets([original] as NSArray)
+            request?.addAssets(missing)
         }
+        return missing.count
     }
 
-    public func unpark(original id: String, albumTitle: String) async throws {
-        let original = try asset(id)
+    public func removeFromAlbum(_ ids: [String], albumTitle: String) async throws {
+        let assets = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
+        guard assets.count > 0 else { return }
         var albums: [PHAssetCollection] = []  // two devices may each have made one
         PHAssetCollection.fetchAssetCollections(with: .album, subtype: .albumRegular, options: nil)
             .enumerateObjects { album, _, _ in
@@ -279,7 +322,7 @@ public final class PhotoKitLibrary: VideoLibrary, @unchecked Sendable {
         let targets = albums
         try await PHPhotoLibrary.shared().performChanges {
             for album in targets {
-                PHAssetCollectionChangeRequest(for: album)?.removeAssets([original] as NSArray)
+                PHAssetCollectionChangeRequest(for: album)?.removeAssets(assets)
             }
         }
     }

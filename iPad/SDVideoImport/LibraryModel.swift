@@ -48,6 +48,7 @@ final class LibraryModel: ObservableObject {
     /// nil when this build cannot use iCloud.
     private let sync: RecordSync?
     private var worker: Task<Void, Never>?
+    private let background = BackgroundWork()
     private let cameras: CameraCache
     private var cameraReader: Task<Void, Never>?
     /// Changes when camera names were read, so that the list shows them.
@@ -141,6 +142,16 @@ final class LibraryModel: ObservableObject {
         records.values.filter { $0.status == .replaced }.count
     }
 
+    /// New videos of Shared Library originals that wait in the album to be moved there by hand.
+    var waitingToMove: Int {
+        let inShared = Set(items.filter { $0.inSharedLibrary == true }.map(\.id))
+        let notShared = Set(items.filter { $0.inSharedLibrary == false }.map(\.id))
+        return records.filter { id, record in
+            record.status == .replaced && inShared.contains(id)
+                && record.newIdentifier.map(notShared.contains) == true
+        }.count
+    }
+
     var savedBytes: Int64 {
         records.values
             .filter { $0.status == .replaced || $0.status == .deleted }
@@ -199,7 +210,24 @@ final class LibraryModel: ObservableObject {
             records = store.records
         } catch {
             message = "Cannot read the Photos library: \(error.localizedDescription)"
+            return
         }
+        await gatherVideosToMove()
+    }
+
+    /// Also gathers the new videos made before the album of the videos to move existed.
+    private func gatherVideosToMove() async {
+        let note: String
+        do {
+            let added = try await pipeline.gatherVideosToMove()
+            guard added > 0 else { return }
+            note = "\(added) new video(s) added to the album \"\(Pipeline.moveAlbumTitle)\": "
+                + "their original is in the Shared Library. In Photos, move them there."
+        } catch {
+            note = "Could not add videos to the album \"\(Pipeline.moveAlbumTitle)\": "
+                + error.localizedDescription
+        }
+        message = [message, note].compactMap { $0 }.joined(separator: "\n\n")
     }
 
     /// The videos Start will re-encode: the selected ones of the To do list, or all of it.
@@ -231,6 +259,13 @@ final class LibraryModel: ObservableObject {
         UIApplication.shared.isIdleTimerDisabled = true  // keep the screen on
         let pipeline = pipeline
         let progress = progress
+        let background = background
+        background.begin(title: "Making videos smaller", subtitle: "\(videos.count) video(s)",
+                         onStart: { progress.canLeave = true },
+                         onExpire: { [weak self] in
+                             progress.canLeave = false
+                             self?.backgroundTimeEnded()
+                         })
 
         worker = Task {
             for (index, item) in videos.enumerated() {
@@ -239,15 +274,23 @@ final class LibraryModel: ObservableObject {
                 let outputs = self.outputs
                 guard Policy.decide(item: item, record: self.records[item.id], settings: settings,
                                     outputs: outputs) == .process else { continue }
-                progress.begin(item.filename, position: "\(index + 1) of \(videos.count)",
-                               phase: .downloading)
+                let position = "\(index + 1) of \(videos.count)"
+                progress.begin(item.filename, position: position, phase: .downloading)
+                let subtitle = "\(position): \(item.filename)"
+                background.report(BackgroundWork.share(index, of: videos.count, .downloading, 0),
+                                  subtitle: subtitle)
                 await pipeline.process(item, settings: settings) { phase, fraction in
-                    Task { @MainActor in progress.update(phase, fraction) }
+                    Task { @MainActor in
+                        progress.update(phase, fraction)
+                        background.report(BackgroundWork.share(index, of: videos.count, phase,
+                                                               fraction), subtitle: subtitle)
+                    }
                 }
                 self.records = self.store.records
                 self.pushRecords()
             }
             progress.end()
+            background.end(success: !Task.isCancelled)
             UIApplication.shared.isIdleTimerDisabled = false
             self.isRunning = false
             self.isStopping = false
@@ -265,12 +308,20 @@ final class LibraryModel: ObservableObject {
         worker?.cancel()
     }
 
-    /// iPadOS stops the video encoder when the app is not on screen.
+    /// Without a background task from iOS, the video encoder stops when the app is not on screen.
     func appWentToBackground() {
-        guard isRunning, !isStopping else { return }
+        guard isRunning, !isStopping, !background.isActive else { return }
         stop()
         message = "The work was paused because the app was closed. Nothing is lost. "
             + "Open the app and press Start to continue."
+    }
+
+    /// iOS ended the background time, or the person stopped the work from its progress.
+    private func backgroundTimeEnded() {
+        guard isRunning, !isStopping else { return }
+        stop()
+        message = "The work in the background was stopped. Nothing is lost. "
+            + "Press Start to continue."
     }
 
     /// Delete the new videos and bring back the originals. `ids` may name either.
@@ -303,6 +354,11 @@ final class LibraryModel: ObservableObject {
             var text = "\(result.deleted) original(s) moved to Recently Deleted."
             if result.heldBack > 0 {
                 text += " \(result.heldBack) kept, because the new video was not found in Photos."
+            }
+            if result.notMoved > 0 {
+                text += " \(result.notMoved) kept, because they are in the Shared Library and their "
+                    + "new video is not there yet. In Photos, move the videos of the album "
+                    + "\"\(Pipeline.moveAlbumTitle)\" to the Shared Library, then delete again."
             }
             message = text
         } catch {

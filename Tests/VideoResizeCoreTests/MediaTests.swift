@@ -220,7 +220,7 @@ final class PipelineTests: TempDirectoryTestCase {
         // Replaced on another device; the new video has not reached this one yet.
         let record = Record(status: .replaced, filename: "IMG_0002.MOV", newIdentifier: nil)
         store.set(record, for: "A")
-        try await library.park(original: "A", albumTitle: Pipeline.albumTitle)
+        try await library.addToAlbum(["A"], albumTitle: Pipeline.albumTitle)
 
         let result = try await pipeline.restore(["A"])
 
@@ -269,6 +269,47 @@ final class PipelineTests: TempDirectoryTestCase {
         XCTAssertEqual(result.heldBack, 1)
         XCTAssertTrue(library.exists("A"))
         XCTAssertEqual(store.record(for: "A")?.status, .replaced)
+    }
+
+    func testASharedLibraryOriginalStaysUntilItsNewVideoIsMovedThere() async throws {
+        try await prepare()
+        library.shared = ["A"]
+        await pipeline.process(item, settings: AppSettings()) { _, _ in }
+        XCTAssertEqual(library.toMove, ["NEW-A"])
+
+        var result = try await pipeline.deleteOriginals()
+        XCTAssertEqual(result.deleted, 0)
+        XCTAssertEqual(result.notMoved, 1)
+        XCTAssertTrue(library.exists("A"), "the other members still see the video")
+        XCTAssertEqual(store.record(for: "A")?.status, .replaced)
+
+        library.shared.insert("NEW-A")  // moved by hand in Photos
+        result = try await pipeline.deleteOriginals()
+        XCTAssertEqual(result.deleted, 1)
+        XCTAssertEqual(result.notMoved, 0)
+        XCTAssertFalse(library.exists("A"))
+        XCTAssertTrue(library.toMove.isEmpty, "the album keeps only what is still to move")
+    }
+
+    func testNewVideosMadeBeforeTheMoveAlbumAreGatheredInIt() async throws {
+        try await prepare()
+        library.shared = ["A", "B", "C"]
+        library.present.formUnion(["B", "C", "D", "NEW-B", "NEW-C", "NEW-D"])
+        library.shared.insert("NEW-C")  // already moved
+        store.set(Record(status: .replaced, filename: "A.MOV", newIdentifier: "NEW-A"), for: "A")
+        store.set(Record(status: .replaced, filename: "B.MOV", newIdentifier: "NEW-B"), for: "B")
+        store.set(Record(status: .replaced, filename: "C.MOV", newIdentifier: "NEW-C"), for: "C")
+        store.set(Record(status: .replaced, filename: "D.MOV", newIdentifier: "NEW-D"), for: "D")
+        store.set(Record(status: .replaced, filename: "E.MOV", newIdentifier: nil), for: "E")
+        library.present.insert("NEW-A")
+        library.toMove = ["NEW-A"]  // made after the album existed
+
+        var added = try await pipeline.gatherVideosToMove()
+        XCTAssertEqual(added, 1)
+        XCTAssertEqual(library.toMove, ["NEW-A", "NEW-B"], "D is personal, C is moved")
+
+        added = try await pipeline.gatherVideosToMove()
+        XCTAssertEqual(added, 0, "nothing twice")
     }
 
     func testSmallSavingKeepsTheOriginal() async throws {
