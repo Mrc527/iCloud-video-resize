@@ -8,15 +8,19 @@ enum Sample {
 
     /// A short H.264 clip of moving noise, encoded wastefully like a camera would.
     static func makeVideo(at url: URL, seconds: Int = 2, width: Int = 640,
-                          height: Int = 360) async throws {
+                          height: Int = 360, location: String? = nil) async throws {
         try? FileManager.default.removeItem(at: url)
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
 
-        let date = AVMutableMetadataItem()
-        date.identifier = .quickTimeMetadataCreationDate
-        date.value = captureDate as NSString
-        date.dataType = kCMMetadataBaseDataType_UTF8 as String
-        writer.metadata = [date]
+        func text(_ identifier: AVMetadataIdentifier, _ value: String) -> AVMetadataItem {
+            let item = AVMutableMetadataItem()
+            item.identifier = identifier
+            item.value = value as NSString
+            item.dataType = kCMMetadataBaseDataType_UTF8 as String
+            return item
+        }
+        writer.metadata = [text(.quickTimeMetadataCreationDate, captureDate)]
+            + (location.map { [text(.quickTimeMetadataLocationISO6709, $0)] } ?? [])
 
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.h264,

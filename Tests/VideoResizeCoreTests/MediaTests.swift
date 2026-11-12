@@ -40,6 +40,26 @@ final class TranscodeTests: TempDirectoryTestCase {
         XCTAssertEqual(output.audioTrackCount, 1)
     }
 
+    func testFFmpegEncodeKeepsCaptureDateAndPosition() async throws {
+        guard let ffmpeg = FFmpegTranscoder.locate() else { throw XCTSkip("ffmpeg is not installed") }
+        let source = temp.appendingPathComponent("IMG_0003.MOV")
+        try await Sample.makeVideo(at: source, location: "+46.0037+008.9511+273.000/")
+        let info = try await Probe.info(source)
+        XCTAssertTrue(info.hasCaptureDate)
+        XCTAssertTrue(info.hasLocation)
+
+        let destination = temp.appendingPathComponent("out.mov")
+        try await FFmpegTranscoder(executable: ffmpeg).transcode(
+            source: source, destination: destination, info: info, quality: .balanced) { _ in }
+        let output = try await Verifier.verify(source: info, output: destination, fullDecode: true)
+
+        XCTAssertTrue(output.isHEVC)
+        XCTAssertEqual(output.latitude ?? 0, 46.0037, accuracy: 0.0001)
+        XCTAssertEqual(output.longitude ?? 0, 8.9511, accuracy: 0.0001)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: temp.path).sorted(),
+                       ["IMG_0003.MOV", "out.mov"], "the intermediate file is left behind")
+    }
+
     func testVerifierRejectsAShorterVideo() async throws {
         let long = temp.appendingPathComponent("long.mov")
         try await Sample.makeVideo(at: long, seconds: 4)

@@ -247,6 +247,43 @@ public struct FFmpegTranscoder: Transcoder {
 
     public func transcode(source: URL, destination: URL, info: MediaInfo, quality: Quality,
                           progress: @escaping @Sendable (Double) -> Void) async throws {
+        // ffmpeg writes the Apple metadata keys (capture date, GPS) in moov/udta/meta,
+        // where AVFoundation does not read them. A passthrough copy writes them again.
+        let encoded = destination.deletingLastPathComponent()
+            .appendingPathComponent("ffmpeg-" + destination.lastPathComponent)
+        defer { try? FileManager.default.removeItem(at: encoded) }
+        try await encode(source: source, destination: encoded, info: info, quality: quality,
+                         progress: progress)
+        try await Self.copy(encoded, to: destination, metadataFrom: source)
+        progress(1)
+    }
+
+    private static func copy(_ encoded: URL, to destination: URL, metadataFrom source: URL) async throws {
+        let metadata = try await AVURLAsset(url: source).loadMetadata(for: .quickTimeMetadata)
+        guard let export = AVAssetExportSession(asset: AVURLAsset(url: encoded),
+                                                presetName: AVAssetExportPresetPassthrough)
+        else { throw MediaError.encodingFailed("cannot copy the metadata") }
+        try? FileManager.default.removeItem(at: destination)
+        export.outputURL = destination
+        export.outputFileType = .mov
+        export.metadata = metadata
+        export.shouldOptimizeForNetworkUse = true
+        await withTaskCancellationHandler {
+            await export.export()
+        } onCancel: {
+            export.cancelExport()
+        }
+        if Task.isCancelled {
+            try? FileManager.default.removeItem(at: destination)
+            throw CancellationError()
+        }
+        guard export.status == .completed else {
+            throw MediaError.encodingFailed(export.error?.localizedDescription ?? "cannot copy the metadata")
+        }
+    }
+
+    private func encode(source: URL, destination: URL, info: MediaInfo, quality: Quality,
+                        progress: @escaping @Sendable (Double) -> Void) async throws {
         let process = Process()
         process.executableURL = executable
         process.arguments = Self.arguments(source: source, destination: destination,
@@ -298,7 +335,6 @@ public struct FFmpegTranscoder: Transcoder {
             throw MediaError.encodingFailed(
                 "ffmpeg: " + message.trimmingCharacters(in: .whitespacesAndNewlines))
         }
-        progress(1)
     }
 }
 #endif
